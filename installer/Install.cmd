@@ -7,7 +7,7 @@ echo.
 if not "%LGA_EXIT%"=="0" (
   echo Installation did not complete. Read the error and log path above.
 ) else (
-  echo Installation complete. Restart Discord if it is open.
+  echo Installation complete. Discord was restarted automatically when detected.
 )
 pause
 exit /b %LGA_EXIT%

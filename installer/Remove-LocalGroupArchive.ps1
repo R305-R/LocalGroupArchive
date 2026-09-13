@@ -5,67 +5,52 @@ param()
 $ErrorActionPreference = "Stop"
 $ManagedRoot = Join-Path $env:LOCALAPPDATA "LocalGroupArchive"
 $VencordRoot = Join-Path $ManagedRoot "Vencord"
-$Injector = Join-Path $ManagedRoot "tools\VencordInstallerCli.exe"
 $BackupRoot = Join-Path $env:LOCALAPPDATA ("LocalGroupArchiveUserPluginsBackup\" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 
-try {
-    Write-Host "Removing LocalGroupArchive and restoring regular Vencord..." -ForegroundColor Cyan
-    if (!(Test-Path -LiteralPath $ManagedRoot)) {
-        Write-Host "The managed build is already gone. The local archive remains untouched." -ForegroundColor Green
-        exit 0
-    }
-    if (!(Test-Path -LiteralPath $Injector)) {
-        throw "The verified Vencord CLI is missing. Run Repair from the Start menu, then uninstall again."
-    }
-
+function Preserve-UnrelatedUserPlugins {
     $userPlugins = Join-Path $VencordRoot "src\userplugins"
-    if (Test-Path -LiteralPath $userPlugins) {
-        $unrelated = @(Get-ChildItem -LiteralPath $userPlugins -Force | Where-Object {
-            $_.Name -notin @("LocalGroupArchive", "LocalGroupArchiveSetup")
-        })
-        if ($unrelated.Count) {
-            New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
-            foreach ($item in $unrelated) {
-                Copy-Item -LiteralPath $item.FullName -Destination $BackupRoot -Recurse -Force
-            }
-            Write-Host "Preserved unrelated userplugins at: $BackupRoot" -ForegroundColor Yellow
-        }
-    }
+    if (!(Test-Path -LiteralPath $userPlugins)) { return }
+    $unrelated = @(Get-ChildItem -LiteralPath $userPlugins -Force | Where-Object {
+        $_.Name -notin @("LocalGroupArchive", "LocalGroupArchiveSetup")
+    })
+    if (!$unrelated.Count) { return }
 
-    foreach ($name in @("Discord", "DiscordCanary", "DiscordPTB", "DiscordDevelopment")) {
+    New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    foreach ($item in $unrelated) { Copy-Item -LiteralPath $item.FullName -Destination $BackupRoot -Recurse -Force }
+    Write-Host "Preserved unrelated userplugins at: $BackupRoot" -ForegroundColor Yellow
+}
+
+function Restore-DiscordAppAsar {
+    $restored = 0
+    foreach ($name in @("Discord", "DiscordPTB", "DiscordCanary", "DiscordDevelopment")) {
         Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force
-    }
+        $base = Join-Path $env:LOCALAPPDATA $name
+        if (!(Test-Path -LiteralPath $base)) { continue }
 
-    $statePath = Join-Path $ManagedRoot "install-state.json"
-    $state = if (Test-Path -LiteralPath $statePath) { Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } else { $null }
-    $branch = if ($state -and ([string]$state.discordBranch) -in @("stable", "ptb", "canary")) {
-        [string]$state.discordBranch
-    } else {
-        "auto"
-    }
+        foreach ($app in @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "app-*" })) {
+            $resources = Join-Path $app.FullName "resources"
+            $appAsar = Join-Path $resources "app.asar"
+            $backupAsar = Join-Path $resources "_app.asar"
+            if (!(Test-Path -LiteralPath $backupAsar)) { continue }
 
-    $oldUserData = $env:VENCORD_USER_DATA_DIR
-    $oldDevInstall = $env:VENCORD_DEV_INSTALL
-    try {
-        $env:VENCORD_USER_DATA_DIR = $null
-        $env:VENCORD_DEV_INSTALL = $null
-        $previousErrorActionPreference = $ErrorActionPreference
-        $global:LASTEXITCODE = 0
-        try {
-            $ErrorActionPreference = "Continue"
-            & $Injector --repair --branch $branch 2>&1 | ForEach-Object { Write-Host ([string]$_) }
-            $injectorExitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
+            Remove-Item -LiteralPath $appAsar -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath $backupAsar -Destination $appAsar -Force
+            $restored++
         }
-        if ($injectorExitCode -ne 0) { throw "Restoring regular Vencord failed with exit code $injectorExitCode." }
-    } finally {
-        $env:VENCORD_USER_DATA_DIR = $oldUserData
-        $env:VENCORD_DEV_INSTALL = $oldDevInstall
     }
+    return $restored
+}
 
-    Remove-Item -LiteralPath $ManagedRoot -Recurse -Force
-    Write-Host "Plugin and managed build tools removed; regular Vencord was restored." -ForegroundColor Green
+try {
+    Write-Host "Removing LocalGroupArchive and restoring Discord..." -ForegroundColor Cyan
+    Preserve-UnrelatedUserPlugins
+    $restored = Restore-DiscordAppAsar
+    if (Test-Path -LiteralPath $ManagedRoot) { Remove-Item -LiteralPath $ManagedRoot -Recurse -Force }
+
+    Write-Host "LocalGroupArchive's managed Vencord runtime was removed." -ForegroundColor Green
+    if ($restored -gt 0) {
+        Write-Host "Discord's original app.asar was restored in $restored installation(s)." -ForegroundColor Green
+    }
     Write-Host "Documents\DiscordLocalArchive was intentionally kept." -ForegroundColor Green
 } catch {
     Write-Host ("Removal needs attention: " + $_.Exception.Message) -ForegroundColor Red

@@ -1,11 +1,11 @@
 #define MyAppName "LocalGroupArchive"
 #ifndef AppVersion
-  #define AppVersion "0.9.2"
+  #define AppVersion "0.9.3"
 #endif
 #define MyAppVersion AppVersion
 #define MyAppPublisher "Faisal"
 #ifndef Repository
-  #define Repository "OWNER/LocalGroupArchive"
+  #define Repository "R305-R/LocalGroupArchive"
 #endif
 
 [Setup]
@@ -37,13 +37,15 @@ Source: "Install-LocalGroupArchive.ps1"; DestDir: "{app}\installer"; Flags: igno
 Source: "Update-LocalGroupArchive.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "Remove-LocalGroupArchive.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "..\plugin\*"; DestDir: "{app}\plugin"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\LocalGroupArchive-VencordDist-v{#MyAppVersion}.zip"; DestDir: "{app}\payload"; DestName: "VencordDist.zip"; Flags: ignoreversion
+Source: "..\dist\LocalGroupArchive-VencordDist-v{#MyAppVersion}.zip.sha256"; DestDir: "{app}\payload"; DestName: "VencordDist.zip.sha256"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\SECURITY.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Repair LocalGroupArchive"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\Install-LocalGroupArchive.ps1"" -Action Repair -PayloadRoot ""{app}\plugin"" -Repository ""{#Repository}"""; WorkingDir: "{app}"
+Name: "{group}\Repair LocalGroupArchive"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\Install-LocalGroupArchive.ps1"" -Action Repair -PayloadRoot ""{app}\plugin"" -Repository ""{#Repository}"" -PrebuiltDistArchive ""{app}\payload\VencordDist.zip"" -PrebuiltDistChecksum ""{app}\payload\VencordDist.zip.sha256"""; WorkingDir: "{app}"
 Name: "{group}\Check for updates"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\Update-LocalGroupArchive.ps1"" -Repository ""{#Repository}"" -CurrentVersion ""{#MyAppVersion}"""; WorkingDir: "{app}"
 Name: "{group}\Open local archive"; Filename: "{userdocs}\Discord Local Archive.html"
 
@@ -62,11 +64,13 @@ begin
   begin
     ResultPath := ExpandConstant('{tmp}\LocalGroupArchive-install-result.txt');
     DeleteFile(ResultPath);
-    WizardForm.StatusLabel.Caption := 'Installing and validating developer Vencord...';
+    WizardForm.StatusLabel.Caption := 'Installing the prebuilt developer Vencord bundle...';
     Params := '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' +
       ExpandConstant('{app}\installer\Install-LocalGroupArchive.ps1') +
       '" -Action Install -PayloadRoot "' + ExpandConstant('{app}\plugin') +
-      '" -Repository "{#Repository}" -ResultFile "' + ResultPath + '"';
+      '" -Repository "{#Repository}" -ResultFile "' + ResultPath +
+      '" -PrebuiltDistArchive "' + ExpandConstant('{app}\payload\VencordDist.zip') +
+      '" -PrebuiltDistChecksum "' + ExpandConstant('{app}\payload\VencordDist.zip.sha256') + '"';
     if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       Params, ExpandConstant('{app}'), SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode) then
       RaiseException('Could not start the LocalGroupArchive setup script.');

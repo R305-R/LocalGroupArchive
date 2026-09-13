@@ -12,7 +12,7 @@ Please open a private GitHub security advisory for vulnerabilities that could ex
 - The viewer builds message content with DOM text nodes rather than assigning archived content to `innerHTML`.
 - Only a small allowlist of raster image/audio/video formats is previewed; HTML, SVG, and other active attachment types are offered as downloads instead of being opened inline.
 - The viewer/API helper binds only to `127.0.0.1`, requires a random per-session token for the viewer/API, accepts only `null` or its own loopback origin, and stops with the plugin. Archive file serving is path-contained to the detected archive root.
-- Installer Node.js archives are checked against Node's official SHA-256 list. The Vencord source URL is pinned to the commit SHA returned by GitHub, and the official Vencord CLI is checked against its published checksum list. Updates are checked against the checksum asset produced by the release workflow.
+- The user-facing installer does not execute Node.js, pnpm, or third-party dependency installers. GitHub Actions builds Vencord from the pinned tested commit, runs TypeScript/ESLint checks, packages the Windows runtime, and publishes SHA-256 files for both the bundle and installer. The EXE verifies its embedded runtime bundle before installing it, and updater downloads are checked against the release checksum asset.
 
 ## User responsibility
 

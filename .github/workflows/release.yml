@@ -19,15 +19,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: End-to-end installer engine test
-        shell: powershell
-        run: |
-          $result = Join-Path $env:RUNNER_TEMP "LocalGroupArchive-install-result.txt"
-          & .\installer\Install-LocalGroupArchive.ps1 -Action Install -PayloadRoot .\plugin -Repository $env:GITHUB_REPOSITORY -SkipInject -ResultFile $result
-          if ($LASTEXITCODE -ne 0) {
-            if (Test-Path -LiteralPath $result) { Get-Content -LiteralPath $result }
-            throw "Installer engine failed with exit code $LASTEXITCODE"
-          }
       - name: Validate release version
         shell: pwsh
         run: |
@@ -38,6 +29,47 @@ jobs:
           }
           "LGA_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "LGA_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: actions/checkout@v4
+        with:
+          repository: Vendicated/Vencord
+          ref: 0850f37fbb1623aa6330764d8f4b1e0b2617dcdf
+          path: Vencord
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: Vencord/package.json
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: Vencord/pnpm-lock.yaml
+      - name: Add LocalGroupArchive to the Windows build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path Vencord\src\userplugins -Force | Out-Null
+          Copy-Item -LiteralPath plugin\LocalGroupArchive -Destination Vencord\src\userplugins\LocalGroupArchive -Recurse -Force
+          Copy-Item -LiteralPath plugin\LocalGroupArchiveSetup -Destination Vencord\src\userplugins\LocalGroupArchiveSetup -Recurse -Force
+      - name: Build the precompiled Windows Vencord runtime
+        working-directory: Vencord
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build --disable-updater
+          pnpm testTsc
+          pnpm exec eslint src/userplugins/LocalGroupArchive src/userplugins/LocalGroupArchiveSetup
+      - name: Package and hash the prebuilt runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $bundle = "dist\LocalGroupArchive-VencordDist-v$env:LGA_VERSION.zip"
+          Compress-Archive -Path Vencord\dist\* -DestinationPath $bundle -Force
+          $hash = (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $bundle)" | Set-Content -LiteralPath "$bundle.sha256" -Encoding ascii
+      - name: End-to-end prebuilt installer engine test
+        shell: powershell
+        run: |
+          $bundle = "dist\LocalGroupArchive-VencordDist-v$env:LGA_VERSION.zip"
+          $result = Join-Path $env:RUNNER_TEMP "LocalGroupArchive-install-result.txt"
+          & .\installer\Install-LocalGroupArchive.ps1 -Action Install -PayloadRoot .\plugin -Repository $env:GITHUB_REPOSITORY -SkipInject -ResultFile $result -PrebuiltDistArchive $bundle -PrebuiltDistChecksum "$bundle.sha256"
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
       - name: Build installer and portable source package
@@ -47,7 +79,7 @@ jobs:
           & $iscc "/DRepository=$env:GITHUB_REPOSITORY" "/DAppVersion=$env:LGA_VERSION" "installer\LocalGroupArchive.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
           Compress-Archive -Path plugin,installer,tests,.github,package.json,README.md,CHANGELOG.md,SECURITY.md,LICENSE -DestinationPath "dist\LocalGroupArchive-v$env:LGA_VERSION-source.zip" -Force
-          $exe = Get-ChildItem dist\LocalGroupArchive-Setup*.exe | Select-Object -First 1
+          $exe = Get-ChildItem "dist\LocalGroupArchive-Setup-v$env:LGA_VERSION.exe" | Select-Object -First 1
           $hash = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $($exe.Name)" | Set-Content -LiteralPath "dist\$($exe.Name).sha256" -Encoding ascii
       - name: Publish GitHub Release

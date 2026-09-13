@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.3
+
+- Replaced the on-device Vencord build with a **precompiled Windows Vencord runtime** produced by the release workflow. The user's PC no longer installs Node.js, pnpm, or 561 dependency packages.
+- Eliminated the persistent Windows `UNKNOWN/-4094` failures that moved between `diff/package.json` and `esbuild/package.json`; the failing dependency-linking phase no longer exists on the user's machine.
+- The release now ships a separately hashed `LocalGroupArchive-VencordDist` bundle. The EXE embeds that bundle and verifies its SHA-256 before installing it.
+- Added a native PowerShell `app.asar` loader generator and structural validator, with transactional replacement and restoration of Discord's original `_app.asar`.
+- Release validation now builds the runtime on `windows-latest`, checks TypeScript and ESLint, packages it, verifies the prebuilt installation engine without Discord, and only then compiles/publishes the EXE.
+- Updated uninstall to restore Discord's original `app.asar` directly and preserve `Documents\\DiscordLocalArchive`.
+- Kept the v0.9.1 Panic Burst capture engine and v0.9.2 visible failure diagnostics unchanged.
+
 ## 0.9.2
 
 - Fixed the Windows installer failure observed after pnpm finished linking 561 packages and then returned `UNKNOWN/-4094` while opening `node_modules/diff/package.json`.

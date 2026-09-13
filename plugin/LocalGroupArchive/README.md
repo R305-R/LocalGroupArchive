@@ -1,11 +1,11 @@
-# LocalGroupArchive v0.9.2
+# LocalGroupArchive v0.9.3
 
 The complete Arabic/English installation, privacy, command, architecture, and release documentation is in the repository root [README](../../README.md).
 
 This folder is copied to `Vencord/src/userplugins/LocalGroupArchive`. The required first-run spotlight helper lives beside it at `../LocalGroupArchiveSetup`.
 
 
-## v0.9.2 architecture
+## v0.9.3 architecture
 
 - **New-to-you groups only:** a persisted cutoff filters lazy hydration of old DMs, while post-baseline `CHANNEL_CREATE` and current-user `CHANNEL_RECIPIENT_ADD` events immediately protect groups that actually become accessible to you now.
 - **Warm Mirror:** Gateway events persist live creates/updates/deletes/reactions, while a round-robin 45-second reconciliation fetches only the newest delta for proven protected groups.
@@ -18,7 +18,7 @@ This folder is copied to `Vencord/src/userplugins/LocalGroupArchive`. The requir
 - **Network isolation:** all CDN downloads stay frozen during critical text capture. Voice Messages lead the media queue after text traffic stops.
 - **Ghost Group DMs:** a protected group removed from Discord remains in the DM list as a local read-only archived row. Existing queued downloads are preserved.
 - **Rate-limit safe:** every route uses Vencord `RestAPI`; the plugin does not bypass Discord rate limits or raw-fetch with the account token.
-- **Resilient Windows setup:** the installer uses an isolated pnpm store, copy imports, bounded retries, a clean final dependency retry, and reports the actual log tail inside the setup error dialog.
+- **Prebuilt Windows setup:** GitHub builds and validates the complete Vencord runtime. The installer verifies and injects that bundle without Node.js, pnpm, dependency linking, or an on-device build.
 
 ## v0.5 highlights
 

@@ -1,6 +1,6 @@
 {
   "name": "local-group-archive",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "description": "A resilient local Group DM archive userplugin for developer Vencord.",
   "license": "GPL-3.0-or-later",

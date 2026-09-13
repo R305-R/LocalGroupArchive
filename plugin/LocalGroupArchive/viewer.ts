@@ -66,7 +66,7 @@ ${base}
 <div class="app">
   <aside class="rail"><div class="logo">✦</div><div class="railLine"></div><div class="railIcon">💬</div></aside>
   <aside class="sidebar">
-    <div class="brand"><div><div class="brandTitle">Local Group Archive</div><div class="brandSub">LOCAL • v0.9.2</div></div></div>
+    <div class="brand"><div><div class="brandTitle">Local Group Archive</div><div class="brandSub">LOCAL • v0.9.3</div></div></div>
     <div class="searchBox"><span>⌕</span><input id="search" class="search" autocomplete="off" placeholder="ابحث في كل الأرشيف"></div>
     <div class="section">القروبات المحفوظة</div><div id="groups" class="groups">${staticGroups}</div>
   </aside>

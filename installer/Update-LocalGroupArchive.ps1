@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Repository,
-    [string]$CurrentVersion = "0.9.2"
+    [string]$CurrentVersion = "0.9.3"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +25,8 @@ try {
     }
 
     $installerAsset = $release.assets | Where-Object { $_.name -match '^LocalGroupArchive-Setup.*\.exe$' } | Select-Object -First 1
-    $checksumAsset = $release.assets | Where-Object { $_.name -match '\.sha256$' } | Select-Object -First 1
+    $checksumAssetName = "$($installerAsset.name).sha256"
+    $checksumAsset = $release.assets | Where-Object { $_.name -eq $checksumAssetName } | Select-Object -First 1
     if (!$installerAsset -or !$checksumAsset) { throw "The latest release is missing its installer or SHA-256 file." }
 
     $installer = Join-Path $TempRoot $installerAsset.name

@@ -4,34 +4,33 @@ param(
     [ValidateSet("Install", "Repair")]
     [string]$Action = "Install",
     [string]$PayloadRoot = (Join-Path $PSScriptRoot "..\plugin"),
-    [string]$Repository = "OWNER/LocalGroupArchive",
+    [string]$Repository = "R305-R/LocalGroupArchive",
     [ValidateSet("auto", "stable", "ptb", "canary")]
     [string]$DiscordBranch = "auto",
     [switch]$SkipInject,
-    [string]$ResultFile = ""
+    [string]$ResultFile = "",
+    [string]$PrebuiltDistArchive = "",
+    [string]$PrebuiltDistChecksum = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$ProductVersion = "0.9.2"
+$ProductVersion = "0.9.3"
 $PinnedVencordCommit = "0850f37fbb1623aa6330764d8f4b1e0b2617dcdf"
 $InstallRoot = Join-Path $env:LOCALAPPDATA "LocalGroupArchive"
-$ToolsRoot = Join-Path $InstallRoot "tools"
-$NodeRoot = Join-Path $ToolsRoot "node"
-$PnpmRoot = Join-Path $ToolsRoot "pnpm"
-$PnpmStoreRoot = Join-Path $ToolsRoot "pnpm-store"
-$InjectorPath = Join-Path $ToolsRoot "VencordInstallerCli.exe"
 $VencordRoot = Join-Path $InstallRoot "Vencord"
+$VencordDistRoot = Join-Path $VencordRoot "dist"
 $RollbackRoot = Join-Path $InstallRoot "rollback"
 $LogRoot = Join-Path $InstallRoot "logs"
+$LegacyToolsRoot = Join-Path $InstallRoot "tools"
 $RunId = Get-Date -Format "yyyyMMdd-HHmmss"
 $LogFile = Join-Path $LogRoot "install-$RunId.log"
 $StagingRoot = Join-Path $env:TEMP ("LocalGroupArchive-" + [guid]::NewGuid().ToString("N"))
 $BackupRoot = Join-Path $RollbackRoot ("Vencord-" + $RunId)
 $BackupCreated = $false
-$VencordCommit = $null
+$InstalledDiscordProcess = ""
 
 function Write-Step([string]$Message) {
     Write-Host ""
@@ -56,77 +55,18 @@ function Write-InstallerResult {
     )
 
     if ([string]::IsNullOrWhiteSpace($ResultFile)) { return }
-
     $resultDirectory = Split-Path -Parent $ResultFile
     if (![string]::IsNullOrWhiteSpace($resultDirectory)) {
         New-Item -ItemType Directory -Path $resultDirectory -Force | Out-Null
     }
 
-    $details = @(
-        "Status: $Status",
-        "Message: $Message",
-        "Log: $LogFile"
-    )
+    $details = @("Status: $Status", "Message: $Message", "Log: $LogFile")
     if ($Status -eq "FAILED" -and (Test-Path -LiteralPath $LogFile)) {
         $details += ""
         $details += "Last log lines:"
         $details += @(Get-Content -LiteralPath $LogFile -Tail 14)
     }
     $details | Set-Content -LiteralPath $ResultFile -Encoding UTF8
-}
-
-function Invoke-Logged {
-    param(
-        [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
-        [Parameter(Mandatory = $true)][string]$Label
-    )
-
-    if (!(Test-Path -LiteralPath $FilePath)) {
-        throw "Required executable was not found: $FilePath"
-    }
-
-    Write-Step $Label
-    Push-Location $WorkingDirectory
-    try {
-        # Native tools such as pnpm may write normal progress/lifecycle lines to stderr.
-        # With the installer's global ErrorActionPreference=Stop, PowerShell 5.1 can
-        # promote those stderr records to terminating errors before the process exits.
-        # Temporarily keep native stderr non-terminating, merge it into the log, and
-        # decide success strictly from the native process exit code instead.
-        $previousErrorActionPreference = $ErrorActionPreference
-        $global:LASTEXITCODE = 0
-        try {
-            $ErrorActionPreference = "Continue"
-            & $FilePath @Arguments 2>&1 | ForEach-Object {
-                $line = [string]$_
-                Write-Host ("     " + $line)
-                Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
-            }
-            $exitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
-        }
-
-        if ($null -eq $exitCode) { $exitCode = 0 }
-        if ($exitCode -ne 0) { throw "$Label failed with exit code $exitCode." }
-    } finally {
-        Pop-Location
-    }
-}
-
-function Stop-DiscordForInjection {
-    $running = @()
-    foreach ($name in @("Discord", "DiscordCanary", "DiscordPTB", "DiscordDevelopment")) {
-        $running += @(Get-Process -Name $name -ErrorAction SilentlyContinue)
-    }
-    $running = @($running | Sort-Object -Property Id -Unique)
-    if ($running.Count -eq 0) { return }
-
-    Write-Warn "Discord must restart so the developer build can be injected; closing it now"
-    $running | Stop-Process -Force
-    $running | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
 }
 
 function Get-Sha256([string]$Path) {
@@ -141,65 +81,71 @@ function Save-RemoteFile([string]$Uri, [string]$Destination) {
     }
 }
 
-function Install-PortableNode {
-    Write-Step "Downloading a private Node.js LTS runtime"
-    $index = Invoke-RestMethod -UseBasicParsing -Uri "https://nodejs.org/dist/index.json" -Headers @{ "User-Agent" = "LocalGroupArchive-Installer/$ProductVersion" }
-    $release = $index | Where-Object { $_.lts } | Select-Object -First 1
-    if (!$release -or !$release.version) { throw "Could not resolve the latest Node.js LTS version." }
+function Resolve-PrebuiltDistArchive {
+    $archive = $PrebuiltDistArchive
+    $checksum = $PrebuiltDistChecksum
 
-    $nativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
-    $architecture = if ($nativeArchitecture -eq "ARM64") { "arm64" } else { "x64" }
-    $archiveName = "node-$($release.version)-win-$architecture.zip"
-    $baseUri = "https://nodejs.org/dist/$($release.version)"
-    $archivePath = Join-Path $StagingRoot $archiveName
-    $checksumsPath = Join-Path $StagingRoot "SHASUMS256.txt"
-    Save-RemoteFile "$baseUri/$archiveName" $archivePath
-    Save-RemoteFile "$baseUri/SHASUMS256.txt" $checksumsPath
+    if ([string]::IsNullOrWhiteSpace($archive)) {
+        Write-Step "Downloading the prebuilt verified Vencord bundle"
+        $headers = @{ "User-Agent" = "LocalGroupArchive-Installer/$ProductVersion"; "Accept" = "application/vnd.github+json" }
+        $release = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repository/releases/tags/v$ProductVersion" -Headers $headers
+        $archiveName = "LocalGroupArchive-VencordDist-v$ProductVersion.zip"
+        $checksumName = "$archiveName.sha256"
+        $archiveAsset = $release.assets | Where-Object { $_.name -eq $archiveName } | Select-Object -First 1
+        $checksumAsset = $release.assets | Where-Object { $_.name -eq $checksumName } | Select-Object -First 1
+        if (!$archiveAsset -or !$checksumAsset) { throw "GitHub Release v$ProductVersion is missing the prebuilt Vencord bundle or checksum." }
 
-    $checksumLine = Get-Content -LiteralPath $checksumsPath | Where-Object { $_ -match ("\s" + [regex]::Escape($archiveName) + "$") } | Select-Object -First 1
-    if (!$checksumLine) { throw "Node.js did not publish a SHA-256 checksum for $archiveName." }
-    $expected = ($checksumLine -split "\s+")[0].ToLowerInvariant()
-    $actual = Get-Sha256 $archivePath
-    if ($actual -ne $expected) { throw "Node.js checksum verification failed." }
-
-    $extractRoot = Join-Path $StagingRoot "node-extracted"
-    Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot -Force
-    $source = Get-ChildItem -LiteralPath $extractRoot -Directory | Select-Object -First 1
-    if (!$source -or !(Test-Path -LiteralPath (Join-Path $source.FullName "node.exe"))) {
-        throw "The downloaded Node.js archive did not contain node.exe."
+        $archive = Join-Path $StagingRoot $archiveName
+        $checksum = Join-Path $StagingRoot $checksumName
+        Save-RemoteFile ([string]$archiveAsset.browser_download_url) $archive
+        Save-RemoteFile ([string]$checksumAsset.browser_download_url) $checksum
+    } else {
+        Write-Step "Loading the embedded prebuilt Vencord bundle"
+        if ([string]::IsNullOrWhiteSpace($checksum)) { $checksum = "$archive.sha256" }
     }
-    if (Test-Path -LiteralPath $NodeRoot) { Remove-Item -LiteralPath $NodeRoot -Recurse -Force }
-    Move-Item -LiteralPath $source.FullName -Destination $NodeRoot
-    Write-Okay "Node.js $($release.version) verified and installed locally"
+
+    if (!(Test-Path -LiteralPath $archive)) { throw "The prebuilt Vencord bundle was not found: $archive" }
+    if (!(Test-Path -LiteralPath $checksum)) { throw "The prebuilt Vencord checksum was not found: $checksum" }
+
+    $checksumText = Get-Content -LiteralPath $checksum -Raw
+    $match = [regex]::Match($checksumText, '(?im)^([A-Fa-f0-9]{64})(?:\s+\*?.+)?\s*$')
+    if (!$match.Success) { throw "The prebuilt Vencord checksum file is invalid." }
+    $expected = $match.Groups[1].Value.ToLowerInvariant()
+    $actual = Get-Sha256 $archive
+    if ($actual -ne $expected) { throw "Prebuilt Vencord bundle checksum verification failed." }
+    Write-Okay "Prebuilt Vencord bundle SHA-256 verified"
+    return [string]$archive
 }
 
-function Get-FreshVencordSource {
-    Write-Step "Downloading the tested official Vencord source"
-    # v0.7 patches Discord's private-DM list. Pin the exact upstream commit that
-    # CI builds and the release was validated against instead of silently
-    # compiling against a future Vencord main whose minified patch seam may drift.
-    $commit = [string]$PinnedVencordCommit
-    if ($commit -notmatch '^[A-Fa-f0-9]{40}$') { throw "The pinned Vencord commit SHA is invalid." }
-    $script:VencordCommit = $commit.ToLowerInvariant()
+function Install-PrebuiltVencord {
+    $archive = Resolve-PrebuiltDistArchive
+    Write-Step "Installing the already-built Vencord runtime (no Node.js or pnpm required)"
 
-    $archivePath = Join-Path $StagingRoot "Vencord-$($commit.Substring(0, 12)).zip"
-    Save-RemoteFile "https://github.com/Vendicated/Vencord/archive/$commit.zip" $archivePath
-    $extractRoot = Join-Path $StagingRoot "vencord-extracted"
-    Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot -Force
-    $source = Get-ChildItem -LiteralPath $extractRoot -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "package.json") } | Select-Object -First 1
-    if (!$source) { throw "The official Vencord archive did not contain package.json." }
+    $extractRoot = Join-Path $StagingRoot "prebuilt-dist"
+    Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot -Force
+    $candidate = $extractRoot
+    if (Test-Path -LiteralPath (Join-Path $extractRoot "dist")) { $candidate = Join-Path $extractRoot "dist" }
+
+    foreach ($required in @("patcher.js", "preload.js", "renderer.js", "renderer.css")) {
+        $requiredPath = Join-Path $candidate $required
+        if (!(Test-Path -LiteralPath $requiredPath) -or (Get-Item -LiteralPath $requiredPath).Length -eq 0) {
+            throw "The prebuilt Vencord bundle is missing $required."
+        }
+    }
+
+    $patcherHeader = (Get-Content -LiteralPath (Join-Path $candidate "patcher.js") -TotalCount 4) -join "`n"
+    if ($patcherHeader -notmatch [regex]::Escape($PinnedVencordCommit.Substring(0, 7))) {
+        throw "The prebuilt Vencord bundle does not match the pinned tested commit."
+    }
+    if ($patcherHeader -notmatch 'Platform:\s*win32') {
+        throw "The prebuilt Vencord bundle was not built for Windows."
+    }
 
     $newRoot = Join-Path $StagingRoot "Vencord-ready"
-    Move-Item -LiteralPath $source.FullName -Destination $newRoot
-
-    # Keep unrelated custom plugins when repairing/updating our managed checkout.
-    $existingUserPlugins = Join-Path $VencordRoot "src\userplugins"
-    $newUserPlugins = Join-Path $newRoot "src\userplugins"
-    New-Item -ItemType Directory -Path $newUserPlugins -Force | Out-Null
-    if (Test-Path -LiteralPath $existingUserPlugins) {
-        Get-ChildItem -LiteralPath $existingUserPlugins -Force | ForEach-Object {
-            Copy-Item -LiteralPath $_.FullName -Destination $newUserPlugins -Recurse -Force
-        }
+    $newDist = Join-Path $newRoot "dist"
+    New-Item -ItemType Directory -Path $newDist -Force | Out-Null
+    Get-ChildItem -LiteralPath $candidate -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $newDist -Recurse -Force
     }
 
     if (Test-Path -LiteralPath $VencordRoot) {
@@ -208,145 +154,157 @@ function Get-FreshVencordSource {
         $script:BackupCreated = $true
     }
     Move-Item -LiteralPath $newRoot -Destination $VencordRoot
-    Write-Okay "Tested official Vencord source is ready at commit $($commit.Substring(0, 12))"
+    Write-Okay "Prebuilt Vencord runtime installed at commit $($PinnedVencordCommit.Substring(0, 12))"
 }
 
-function Install-VerifiedVencordInjector {
-    Write-Step "Downloading and verifying the official Vencord CLI installer"
-    $headers = @{ "User-Agent" = "LocalGroupArchive-Installer/$ProductVersion"; "Accept" = "application/vnd.github+json" }
-    $release = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/Vencord/Installer/releases/latest" -Headers $headers
-    $binaryAsset = $release.assets | Where-Object { $_.name -eq "VencordInstallerCli.exe" } | Select-Object -First 1
-    $checksumAsset = $release.assets | Where-Object { $_.name -eq "checksums.sha256" } | Select-Object -First 1
-    if (!$binaryAsset -or !$checksumAsset) { throw "The official Vencord release is missing its CLI installer or checksum list." }
+function Write-PatcherAsar {
+    param(
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$PatcherPath
+    )
 
-    $downloadedBinary = Join-Path $StagingRoot "VencordInstallerCli.exe"
-    $downloadedChecksums = Join-Path $StagingRoot "VencordInstaller-checksums.sha256"
-    Save-RemoteFile ([string]$binaryAsset.browser_download_url) $downloadedBinary
-    Save-RemoteFile ([string]$checksumAsset.browser_download_url) $downloadedChecksums
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $pathJson = ConvertTo-Json -InputObject $PatcherPath -Compress
+    $indexText = "require($pathJson)"
+    $packageText = "{`n`t`"name`": `"discord`",`n`t`"main`": `"index.js`"`n}"
+    $indexBytes = $utf8.GetBytes($indexText)
+    $packageBytes = $utf8.GetBytes($packageText)
 
-    $checksumText = Get-Content -LiteralPath $downloadedChecksums -Raw
-    $match = [regex]::Match($checksumText, '(?im)^([A-Fa-f0-9]{64})\s+\*?VencordInstallerCli\.exe\s*$')
-    if (!$match.Success) { throw "The official checksum list does not contain VencordInstallerCli.exe." }
-    $expected = $match.Groups[1].Value.ToLowerInvariant()
-    $actual = Get-Sha256 $downloadedBinary
-    if ($actual -ne $expected) { throw "Vencord CLI installer checksum verification failed." }
+    $files = [ordered]@{}
+    $files["index.js"] = [ordered]@{ size = [int]$indexBytes.Length; offset = "0" }
+    $files["package.json"] = [ordered]@{ size = [int]$packageBytes.Length; offset = [string]$indexBytes.Length }
+    $headerJson = ConvertTo-Json -InputObject ([ordered]@{ files = $files }) -Compress -Depth 8
+    $headerBytes = $utf8.GetBytes($headerJson)
+    $headerStringSize = [int]$headerBytes.Length
+    $alignedSize = ($headerStringSize + 3) -band (-bnot 3)
+    $padding = $alignedSize - $headerStringSize
 
-    if (Test-Path -LiteralPath $InjectorPath) { Remove-Item -LiteralPath $InjectorPath -Force }
-    Move-Item -LiteralPath $downloadedBinary -Destination $InjectorPath
-    Write-Okay "Official Vencord CLI installer verified ($($release.tag_name))"
-    return $InjectorPath
-}
-
-function Install-PluginPayload {
-    Write-Step "Installing LocalGroupArchive source plugins"
-    $mainSource = Join-Path $PayloadRoot "LocalGroupArchive"
-    $guideSource = Join-Path $PayloadRoot "LocalGroupArchiveSetup"
-    if (!(Test-Path -LiteralPath (Join-Path $mainSource "index.ts"))) { throw "LocalGroupArchive payload is missing." }
-    if (!(Test-Path -LiteralPath (Join-Path $guideSource "index.ts"))) { throw "The interactive setup guide payload is missing." }
-
-    $userPlugins = Join-Path $VencordRoot "src\userplugins"
-    New-Item -ItemType Directory -Path $userPlugins -Force | Out-Null
-    foreach ($name in @("LocalGroupArchive", "LocalGroupArchiveSetup")) {
-        $destination = Join-Path $userPlugins $name
-        if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Recurse -Force }
-        Copy-Item -LiteralPath (Join-Path $PayloadRoot $name) -Destination $destination -Recurse -Force
-    }
-    Write-Okay "Plugin v$ProductVersion and the live guide were copied"
-}
-
-function Install-PnpmForVencord {
-    $package = Get-Content -LiteralPath (Join-Path $VencordRoot "package.json") -Raw | ConvertFrom-Json
-    $manager = [string]$package.packageManager
-    $pnpmVersion = if ($manager -match '^pnpm@([^+]+)') { $Matches[1] } else { "latest" }
-    $npm = Join-Path $NodeRoot "npm.cmd"
-    if (!(Test-Path -LiteralPath $npm)) { throw "npm.cmd was not found in the private Node.js runtime." }
-    if (Test-Path -LiteralPath $PnpmRoot) { Remove-Item -LiteralPath $PnpmRoot -Recurse -Force }
-    New-Item -ItemType Directory -Path $PnpmRoot -Force | Out-Null
-    Invoke-Logged $npm @("install", "--global", "--prefix", $PnpmRoot, "pnpm@$pnpmVersion") $InstallRoot "Installing Vencord's requested pnpm version"
-    $pnpm = Join-Path $PnpmRoot "pnpm.cmd"
-    if (!(Test-Path -LiteralPath $pnpm)) { throw "pnpm installation did not produce pnpm.cmd." }
-    return $pnpm
-}
-
-function Reset-VencordNodeModules {
-    $nodeModules = Join-Path $VencordRoot "node_modules"
-    if (!(Test-Path -LiteralPath $nodeModules)) { return }
-
-    Write-Warn "Resetting the incomplete Vencord node_modules tree before the final retry"
-    for ($attempt = 1; $attempt -le 4; $attempt++) {
-        try {
-            Remove-Item -LiteralPath $nodeModules -Recurse -Force
-            return
-        } catch {
-            if ($attempt -eq 4) {
-                throw "Could not reset the incomplete node_modules tree: $($_.Exception.Message)"
-            }
-            Start-Sleep -Seconds $attempt
-        }
-    }
-}
-
-function Install-VencordDependencies([string]$Pnpm) {
-    # Windows Defender and filesystem filter drivers can briefly lock a freshly linked
-    # package while pnpm is finalising node_modules (observed as UNKNOWN/-4094). Use an
-    # isolated verified store, copy imports instead of hardlinks, and retry the bounded
-    # operation. The final attempt starts from a clean node_modules tree.
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $arguments = @(
-            "install",
-            "--frozen-lockfile",
-            "--store-dir", $PnpmStoreRoot,
-            "--package-import-method=copy",
-            "--reporter=append-only"
-        )
-        if ($attempt -gt 1) { $arguments += "--force" }
-
-        try {
-            Invoke-Logged $Pnpm $arguments $VencordRoot "Installing verified Vencord dependencies (attempt $attempt/3)"
-            return
-        } catch {
-            $failure = [string]$_.Exception.Message
-            if ($attempt -eq 3) { throw }
-            Write-Warn "Dependency installation hit a transient Windows filesystem error: $failure"
-            if ($attempt -eq 2) { Reset-VencordNodeModules }
-            Start-Sleep -Seconds (2 * $attempt)
-        }
-    }
-}
-
-function Build-And-Inject([string]$Pnpm, [string]$Injector) {
-    $oldPath = $env:Path
-    $oldVencordUserData = $env:VENCORD_USER_DATA_DIR
-    $oldDevInstall = $env:VENCORD_DEV_INSTALL
-    $oldVencordHash = $env:VENCORD_HASH
-    $oldVencordRemote = $env:VENCORD_REMOTE
-    $env:Path = "$NodeRoot;$PnpmRoot;$env:Path"
-    # GitHub source archives intentionally contain no .git directory. These official
-    # build variables make Vencord reproducible without requiring Git on the user's PC.
-    $env:VENCORD_HASH = $VencordCommit.Substring(0, 7)
-    $env:VENCORD_REMOTE = "Vendicated/Vencord"
+    $stream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
     try {
-        Install-VencordDependencies $Pnpm
-        Invoke-Logged $Pnpm @("build", "--disable-updater") $VencordRoot "Building developer Vencord with LocalGroupArchive"
-        if (!$SkipInject) {
-            if (!$Injector -or !(Test-Path -LiteralPath $Injector)) { throw "The verified Vencord CLI installer is missing." }
-            Stop-DiscordForInjection
-            $env:VENCORD_USER_DATA_DIR = $VencordRoot
-            $env:VENCORD_DEV_INSTALL = "1"
-            Invoke-Logged $Injector @("--install", "--branch", $DiscordBranch) $VencordRoot "Injecting the developer build into Discord ($DiscordBranch)"
+        $writer = New-Object System.IO.BinaryWriter($stream)
+        try {
+            foreach ($value in @(4, ($alignedSize + 8), ($alignedSize + 4), $headerStringSize)) { $writer.Write([int]$value) }
+            $writer.Write($headerBytes)
+            if ($padding -gt 0) { $writer.Write($utf8.GetBytes(("0" * $padding))) }
+            $writer.Write($indexBytes)
+            $writer.Write($packageBytes)
+        } finally {
+            $writer.Dispose()
         }
     } finally {
-        $env:Path = $oldPath
-        $env:VENCORD_USER_DATA_DIR = $oldVencordUserData
-        $env:VENCORD_DEV_INSTALL = $oldDevInstall
-        $env:VENCORD_HASH = $oldVencordHash
-        $env:VENCORD_REMOTE = $oldVencordRemote
+        $stream.Dispose()
     }
+}
+
+function Test-PatcherAsar([string]$Path) {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 32) { throw "Generated Discord patch app.asar is unexpectedly small." }
+    $dataSize = [BitConverter]::ToInt32($bytes, 0)
+    $headerStringSize = [BitConverter]::ToInt32($bytes, 12)
+    if ($dataSize -ne 4 -or $headerStringSize -le 0 -or (16 + $headerStringSize) -gt $bytes.Length) {
+        throw "Generated Discord patch app.asar has an invalid header."
+    }
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $headerJson = $utf8.GetString($bytes, 16, $headerStringSize)
+    $header = $headerJson | ConvertFrom-Json
+    if (!$header.files.'index.js' -or !$header.files.'package.json') {
+        throw "Generated Discord patch app.asar is missing its loader files."
+    }
+}
+
+function Stop-Discord([string]$ProcessName) {
+    $running = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    if ($running.Count -eq 0) { return }
+    Write-Warn "Discord must restart for the new build; closing $ProcessName now"
+    $running | Stop-Process -Force
+    $running | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+}
+
+function Start-Discord([string]$ProcessName) {
+    $base = Join-Path $env:LOCALAPPDATA $ProcessName
+    $updater = Join-Path $base "Update.exe"
+    if (Test-Path -LiteralPath $updater) {
+        Start-Process -FilePath $updater -ArgumentList @("--processStart", "$ProcessName.exe")
+        return
+    }
+
+    $executable = Get-ChildItem -LiteralPath $base -Filter "$ProcessName.exe" -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    if ($executable) { Start-Process -FilePath $executable.FullName }
+}
+
+function Resolve-DiscordTarget {
+    $branches = [ordered]@{ stable = "Discord"; ptb = "DiscordPTB"; canary = "DiscordCanary" }
+    $requested = if ($DiscordBranch -eq "auto") { @($branches.Keys) } else { @($DiscordBranch) }
+
+    foreach ($branch in $requested) {
+        $processName = [string]$branches[$branch]
+        $base = Join-Path $env:LOCALAPPDATA $processName
+        if (!(Test-Path -LiteralPath $base)) { continue }
+        $apps = @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "app-*" } | Sort-Object Name -Descending)
+        foreach ($app in $apps) {
+            $resources = Join-Path $app.FullName "resources"
+            if (!(Test-Path -LiteralPath $resources)) { continue }
+            $appAsar = Join-Path $resources "app.asar"
+            $backupAsar = Join-Path $resources "_app.asar"
+            if ((Test-Path -LiteralPath $appAsar) -or (Test-Path -LiteralPath $backupAsar)) {
+                return [pscustomobject]@{ Branch = $branch; ProcessName = $processName; Resources = $resources }
+            }
+        }
+    }
+    throw "Discord was not found. Install/open Discord once, close it, then run this installer again."
+}
+
+function Install-DiscordPatch {
+    $patcher = Join-Path $VencordDistRoot "patcher.js"
+    if (!(Test-Path -LiteralPath $patcher)) { throw "The installed prebuilt Vencord patcher is missing." }
+
+    if ($SkipInject) {
+        Write-Step "Validating the generated Discord app.asar loader"
+        $testAsar = Join-Path $StagingRoot "app.asar"
+        Write-PatcherAsar $testAsar $patcher
+        Test-PatcherAsar $testAsar
+        Write-Okay "Discord app.asar loader passed structural validation"
+        return
+    }
+
+    $target = Resolve-DiscordTarget
+    Stop-Discord $target.ProcessName
+    $appAsar = Join-Path $target.Resources "app.asar"
+    $backupAsar = Join-Path $target.Resources "_app.asar"
+    $newAsar = Join-Path $target.Resources "app.asar.lga-new"
+    $previousPatch = Join-Path $StagingRoot "previous-app.asar"
+    $wasPatched = Test-Path -LiteralPath $backupAsar
+
+    Write-Step "Injecting the prebuilt developer Vencord into Discord ($($target.Branch))"
+    Write-PatcherAsar $newAsar $patcher
+    Test-PatcherAsar $newAsar
+
+    try {
+        if ($wasPatched) {
+            if (Test-Path -LiteralPath $appAsar) { Move-Item -LiteralPath $appAsar -Destination $previousPatch -Force }
+        } else {
+            if (!(Test-Path -LiteralPath $appAsar)) { throw "Discord's original app.asar was not found." }
+            Move-Item -LiteralPath $appAsar -Destination $backupAsar
+        }
+        Move-Item -LiteralPath $newAsar -Destination $appAsar
+    } catch {
+        Remove-Item -LiteralPath $newAsar -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $appAsar -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $previousPatch) {
+            Move-Item -LiteralPath $previousPatch -Destination $appAsar -Force
+        } elseif (!$wasPatched -and (Test-Path -LiteralPath $backupAsar)) {
+            Move-Item -LiteralPath $backupAsar -Destination $appAsar -Force
+        }
+        throw
+    }
+    $script:InstalledDiscordProcess = [string]$target.ProcessName
+    Write-Okay "Developer Vencord was injected into Discord ($($target.Branch))"
 }
 
 function Restore-Backup {
     if (!$BackupCreated -or !(Test-Path -LiteralPath $BackupRoot)) { return }
-    Write-Warn "Restoring the previous managed Vencord source after the failed build"
+    Write-Warn "Restoring the previous managed Vencord runtime after the failed setup"
     if (Test-Path -LiteralPath $VencordRoot) { Remove-Item -LiteralPath $VencordRoot -Recurse -Force }
     Move-Item -LiteralPath $BackupRoot -Destination $VencordRoot
     $script:BackupCreated = $false
@@ -358,7 +316,8 @@ function Save-State {
         action = $Action
         repository = $Repository
         discordBranch = $DiscordBranch
-        vencordCommit = $VencordCommit
+        vencordCommit = $PinnedVencordCommit
+        installMode = "prebuilt-windows-dist"
         installedAt = (Get-Date).ToUniversalTime().ToString("o")
         vencordRoot = $VencordRoot
         logFile = $LogFile
@@ -369,45 +328,45 @@ function Save-State {
 function Prune-OldRollbacks {
     if (!(Test-Path -LiteralPath $RollbackRoot)) { return }
     $old = @(Get-ChildItem -LiteralPath $RollbackRoot -Directory | Sort-Object LastWriteTime -Descending | Select-Object -Skip 1)
-    foreach ($directory in $old) {
-        Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    foreach ($directory in $old) { Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 try {
     if ($env:OS -ne "Windows_NT") { throw "This installer currently supports Windows only." }
     if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw "Repository must use the GitHub OWNER/NAME format." }
-    New-Item -ItemType Directory -Path $InstallRoot, $ToolsRoot, $RollbackRoot, $LogRoot, $StagingRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $InstallRoot, $RollbackRoot, $LogRoot, $StagingRoot -Force | Out-Null
     Set-Content -LiteralPath $LogFile -Value "LocalGroupArchive v$ProductVersion - $Action - $(Get-Date -Format o)" -Encoding UTF8
 
     Write-Host ""
     Write-Host "  LocalGroupArchive v$ProductVersion" -ForegroundColor Magenta
-    Write-Host "  Private developer-Vencord setup (no administrator required)" -ForegroundColor DarkGray
+    Write-Host "  Prebuilt developer-Vencord setup (no Node.js, pnpm, or administrator required)" -ForegroundColor DarkGray
     Write-Host "  Log: $LogFile" -ForegroundColor DarkGray
 
-    Install-PortableNode
-    Get-FreshVencordSource
-    Install-PluginPayload
-    $pnpm = Install-PnpmForVencord
-    $injector = if ($SkipInject) { $null } else { Install-VerifiedVencordInjector }
-    Build-And-Inject $pnpm $injector
+    Install-PrebuiltVencord
+    Install-DiscordPatch
     Save-State
     Prune-OldRollbacks
+    if (Test-Path -LiteralPath $LegacyToolsRoot) {
+        Remove-Item -LiteralPath $LegacyToolsRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (!$SkipInject -and ![string]::IsNullOrWhiteSpace($InstalledDiscordProcess)) {
+        Start-Discord $InstalledDiscordProcess
+    }
 
     Write-Okay "Installation completed"
-    Write-InstallerResult "SUCCESS" "Installation completed successfully."
+    try { Write-InstallerResult "SUCCESS" "Installation completed successfully." } catch { }
     Write-Host ""
-    Write-Host "  Developer Vencord was injected automatically into Discord ($DiscordBranch)." -ForegroundColor Green
-    Write-Host "  Open/restart Discord. The live spotlight will guide you to enable the plugin." -ForegroundColor Green
-    Write-Host "  Your archives remain under Documents\DiscordLocalArchive and are never removed by repair." -ForegroundColor DarkGray
-    if ($BackupCreated -and (Test-Path -LiteralPath $BackupRoot)) {
-        Write-Host "  Rollback copy kept at: $BackupRoot" -ForegroundColor DarkGray
+    if ($SkipInject) {
+        Write-Host "  Prebuilt Vencord runtime and Discord loader validation completed." -ForegroundColor Green
+    } else {
+        Write-Host "  Open Discord. The live spotlight will guide you to enable LocalGroupArchive." -ForegroundColor Green
     }
+    Write-Host "  Your archives under Documents\DiscordLocalArchive were not changed." -ForegroundColor DarkGray
     exit 0
 } catch {
     $message = [string]$_.Exception.Message
     try { Add-Content -LiteralPath $LogFile -Value ("[FATAL] " + $message + "`n" + [string]$_) -Encoding UTF8 } catch { }
-    try { Restore-Backup } catch { Write-Warn "Automatic source rollback also failed: $($_.Exception.Message)" }
+    try { Restore-Backup } catch { Write-Warn "Automatic runtime rollback also failed: $($_.Exception.Message)" }
     Write-Host ""
     Write-Host ("  Installation failed: " + $message) -ForegroundColor Red
     Write-Host ("  Details: " + $LogFile) -ForegroundColor Yellow
