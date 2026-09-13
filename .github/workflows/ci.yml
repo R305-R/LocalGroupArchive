@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  workflow_call:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+
+  powershell-parse:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse installer scripts
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem installer\*.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) {
+              $failed = $true
+              $errors | ForEach-Object { Write-Error "$($_.Extent.File):$($_.Extent.StartLineNumber): $($_.Message)" }
+            }
+          }
+          if ($failed) { throw "PowerShell parser errors were found." }
+
+  vencord-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Vendicated/Vencord
+          path: Vencord
+      - name: Add userplugins
+        run: |
+          mkdir -p Vencord/src/userplugins
+          cp -R plugin/LocalGroupArchive Vencord/src/userplugins/
+          cp -R plugin/LocalGroupArchiveSetup Vencord/src/userplugins/
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: Vencord/package.json
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: Vencord/pnpm-lock.yaml
+      - name: Install and build developer Vencord
+        working-directory: Vencord
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build --disable-updater
+          pnpm testTsc
+          pnpm exec eslint src/userplugins/LocalGroupArchive src/userplugins/LocalGroupArchiveSetup
