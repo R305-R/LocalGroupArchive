@@ -7,7 +7,7 @@
 import { randomBytes } from "crypto";
 import { app, IpcMainInvokeEvent, shell } from "electron";
 import { once } from "events";
-import { createWriteStream } from "fs";
+import { createReadStream, createWriteStream, readdirSync } from "fs";
 import {
     appendFile,
     mkdir,
@@ -19,7 +19,8 @@ import {
     writeFile
 } from "fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http";
-import { join } from "path";
+import { extname, join, resolve, sep } from "path";
+import { createInterface } from "readline";
 import { finished } from "stream/promises";
 
 import { buildViewerHtml as buildModernViewerHtml } from "./viewer";
@@ -28,14 +29,23 @@ const SNOWFLAKE = /^\d{15,22}$/;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_BATCH_BYTES = 24 * 1024 * 1024;
 const MAX_BATCH_MESSAGES = 250;
+const MAX_COVERAGE_BYTES = 2 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 512 * 1024 * 1024;
 const ALLOWED_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
 const ASSET_KINDS = new Set(["avatars", "group-icons", "embeds", "stickers", "emojis"]);
 const ASSET_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,239}$/;
 const DOWNLOAD_TIMEOUT_MS = 45_000;
+const MESSAGE_WRITE_CONCURRENCY = 64;
 
 const viewerChains = new Map<string, Promise<void>>();
+const captureChains = new Map<string, Promise<unknown>>();
 let viewerShellChain: Promise<void> = Promise.resolve();
+let activeMessageWrites = 0;
+const messageWriteWaiters: Array<() => void> = [];
+const knownMessageIds = new Map<string, Set<string>>();
+const knownMessageIdJobs = new Map<string, Promise<Set<string>>>();
+const deletionTimestampCaches = new Map<string, Map<string, string>>();
+const deletionTimestampJobs = new Map<string, Promise<Map<string, string>>>();
 
 const deletedChannels = new Set<string>();
 const activeDownloadControllers = new Map<string, { channelId: string; controller: AbortController; }>();
@@ -45,8 +55,44 @@ let viewerApiPort = 0;
 let viewerApiStart: Promise<{ port: number; token: string }> | null = null;
 const viewerApiToken = randomBytes(24).toString("hex");
 
+let resolvedArchiveRootPath: string | null = null;
+
+function archiveRootCandidates() {
+    const roots = [
+        join(app.getPath("documents"), "DiscordLocalArchive"),
+        join(app.getPath("home"), "Documents", "DiscordLocalArchive"),
+        process.env.USERPROFILE ? join(process.env.USERPROFILE, "Documents", "DiscordLocalArchive") : "",
+        process.env.OneDrive ? join(process.env.OneDrive, "Documents", "DiscordLocalArchive") : "",
+        process.env.OneDriveConsumer ? join(process.env.OneDriveConsumer, "Documents", "DiscordLocalArchive") : "",
+        process.env.OneDriveCommercial ? join(process.env.OneDriveCommercial, "Documents", "DiscordLocalArchive") : ""
+    ].filter(Boolean);
+    return Array.from(new Set(roots));
+}
+
+function archivedChannelCountAt(root: string) {
+    try {
+        return readdirSync(root, { withFileTypes: true })
+            .filter(entry => entry.isDirectory() && SNOWFLAKE.test(entry.name))
+            .length;
+    } catch {
+        return -1;
+    }
+}
+
 function archiveRoot() {
-    return join(app.getPath("documents"), "DiscordLocalArchive");
+    if (resolvedArchiveRootPath) return resolvedArchiveRootPath;
+    const candidates = archiveRootCandidates();
+    let best = candidates[0];
+    let bestCount = archivedChannelCountAt(best);
+    for (const candidate of candidates.slice(1)) {
+        const count = archivedChannelCountAt(candidate);
+        if (count > bestCount) {
+            best = candidate;
+            bestCount = count;
+        }
+    }
+    resolvedArchiveRootPath = best;
+    return best;
 }
 
 function viewerPath() {
@@ -55,6 +101,32 @@ function viewerPath() {
 
 function shortcutViewerPath() {
     return join(app.getPath("documents"), "Discord Local Archive.html");
+}
+
+function viewerDirtyPath(channelId: string) {
+    return join(channelDir(channelId), ".viewer-dirty");
+}
+
+function viewerDataJsonPath(channelId: string) {
+    return join(channelDir(channelId), "viewer-data.json");
+}
+
+function historyCompletePath(channelId: string) {
+    assertSnowflake(channelId, "channel id");
+    return join(channelDir(channelId), ".history-complete");
+}
+
+function captureDir(channelId: string) {
+    assertSnowflake(channelId, "channel id");
+    return join(channelDir(channelId), "capture");
+}
+
+function activeCapturePath(channelId: string) {
+    return join(captureDir(channelId), "history.ndjson");
+}
+
+function captureCoveragePath(channelId: string) {
+    return join(captureDir(channelId), "coverage.json");
 }
 
 function assetDir(kind: string) {
@@ -87,6 +159,10 @@ async function isChannelArchiveDeletedInternal(channelId: string) {
 async function markChannelArchiveDeleted(channelId: string) {
     assertSnowflake(channelId, "channel id");
     deletedChannels.add(channelId);
+    knownMessageIds.delete(channelId);
+    knownMessageIdJobs.delete(channelId);
+    deletionTimestampCaches.delete(channelId);
+    deletionTimestampJobs.delete(channelId);
     await mkdir(deletedMarkerDir(), { recursive: true });
     await writeFileAtomic(deletedMarkerPath(channelId), new Date().toISOString());
 }
@@ -94,6 +170,10 @@ async function markChannelArchiveDeleted(channelId: string) {
 async function restoreChannelArchiveInternal(channelId: string) {
     assertSnowflake(channelId, "channel id");
     deletedChannels.delete(channelId);
+    knownMessageIds.delete(channelId);
+    knownMessageIdJobs.delete(channelId);
+    deletionTimestampCaches.delete(channelId);
+    deletionTimestampJobs.delete(channelId);
     await rm(deletedMarkerPath(channelId), { force: true });
 }
 
@@ -174,6 +254,45 @@ function deletionPath(channelId: string, messageId: string) {
     return join(channelDir(channelId), "deletions", `${messageId}.json`);
 }
 
+async function getKnownMessageIds(channelId: string) {
+    const cached = knownMessageIds.get(channelId);
+    if (cached) return cached;
+    const existing = knownMessageIdJobs.get(channelId);
+    if (existing) return existing;
+
+    const job = (async () => {
+        const ids = new Set<string>();
+        try {
+            const entries = await readdir(messageDir(channelId), { withFileTypes: true });
+            for (const entry of entries) {
+                if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+                const id = entry.name.slice(0, -5);
+                if (SNOWFLAKE.test(id)) ids.add(id);
+            }
+        } catch { }
+        knownMessageIds.set(channelId, ids);
+        return ids;
+    })().finally(() => knownMessageIdJobs.delete(channelId));
+    knownMessageIdJobs.set(channelId, job);
+    return job;
+}
+
+async function getDeletionTimestampCache(channelId: string) {
+    const cached = deletionTimestampCaches.get(channelId);
+    if (cached) return cached;
+    const existing = deletionTimestampJobs.get(channelId);
+    if (existing) return existing;
+
+    const job = readDeletionTimestamps(channelId)
+        .then(map => {
+            deletionTimestampCaches.set(channelId, map);
+            return map;
+        })
+        .finally(() => deletionTimestampJobs.delete(channelId));
+    deletionTimestampJobs.set(channelId, job);
+    return job;
+}
+
 function revisionSignature(record: any) {
     return JSON.stringify({
         content: record?.content ?? "",
@@ -231,8 +350,22 @@ async function fetchWithValidatedRedirects(
 
 function jsSafeJson(value: unknown) {
     return (JSON.stringify(value) ?? "null")
+        .replace(/</g, "\\u003c")
         .replace(/\u2028/g, "\\u2028")
         .replace(/\u2029/g, "\\u2029");
+}
+
+async function withMessageWriteSlot<T>(op: () => Promise<T>): Promise<T> {
+    if (activeMessageWrites >= MESSAGE_WRITE_CONCURRENCY) {
+        await new Promise<void>(resolve => messageWriteWaiters.push(resolve));
+    }
+    activeMessageWrites++;
+    try {
+        return await op();
+    } finally {
+        activeMessageWrites--;
+        messageWriteWaiters.shift()?.();
+    }
 }
 
 function queueViewerOp(channelId: string, op: () => Promise<void>) {
@@ -244,6 +377,18 @@ function queueViewerOp(channelId: string, op: () => Promise<void>) {
             if (viewerChains.get(channelId) === next) viewerChains.delete(channelId);
         });
     viewerChains.set(channelId, next);
+    return next;
+}
+
+function queueCaptureOp<T>(channelId: string, op: () => Promise<T>): Promise<T> {
+    const previous = captureChains.get(channelId) ?? Promise.resolve();
+    const next: Promise<T> = previous
+        .catch(() => undefined)
+        .then(op)
+        .finally(() => {
+            if (captureChains.get(channelId) === next) captureChains.delete(channelId);
+        });
+    captureChains.set(channelId, next);
     return next;
 }
 
@@ -426,6 +571,84 @@ async function deleteChannelArchiveInner(channelId: string) {
     return true;
 }
 
+function viewerHttpUrl(port: number, token: string, channelId?: string, removed = false) {
+    const params = new URLSearchParams({ token });
+    if (channelId) params.set("channel", channelId);
+    if (removed) params.set("removed", "1");
+    return `http://127.0.0.1:${port}/viewer?${params.toString()}`;
+}
+
+function archiveContentType(path: string) {
+    switch (extname(path).toLowerCase()) {
+        case ".html": return "text/html; charset=utf-8";
+        case ".js": return "text/javascript; charset=utf-8";
+        case ".json": return "application/json; charset=utf-8";
+        case ".png": return "image/png";
+        case ".jpg": case ".jpeg": return "image/jpeg";
+        case ".gif": return "image/gif";
+        case ".webp": return "image/webp";
+        case ".svg": return "image/svg+xml";
+        case ".mp4": return "video/mp4";
+        case ".webm": return "video/webm";
+        case ".mov": return "video/quicktime";
+        case ".mp3": return "audio/mpeg";
+        case ".ogg": case ".oga": return "audio/ogg";
+        case ".wav": return "audio/wav";
+        case ".m4a": return "audio/mp4";
+        default: return "application/octet-stream";
+    }
+}
+
+async function serveArchiveFile(req: IncomingMessage, res: ServerResponse, rawRelative: string) {
+    let relative: string;
+    try { relative = decodeURIComponent(rawRelative); } catch { res.statusCode = 400; res.end("Bad path"); return; }
+    const root = resolve(archiveRoot());
+    const path = resolve(root, relative.replace(/^[/\\]+/, ""));
+    if (path !== root && !path.startsWith(root + sep)) {
+        res.statusCode = 403;
+        res.end("Forbidden");
+        return;
+    }
+
+    let info;
+    try { info = await stat(path); } catch { res.statusCode = 404; res.end("Not found"); return; }
+    if (!info.isFile()) { res.statusCode = 404; res.end("Not found"); return; }
+
+    res.setHeader("Content-Type", archiveContentType(path));
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
+
+    const { range } = req.headers;
+    if (range) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+        if (match) {
+            let start = match[1] ? Number(match[1]) : 0;
+            let end = match[2] ? Number(match[2]) : info.size - 1;
+            if (!match[1] && match[2]) {
+                const suffix = Number(match[2]);
+                start = Math.max(0, info.size - suffix);
+                end = info.size - 1;
+            }
+            if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start && start < info.size) {
+                end = Math.min(end, info.size - 1);
+                res.statusCode = 206;
+                res.setHeader("Content-Range", `bytes ${start}-${end}/${info.size}`);
+                res.setHeader("Content-Length", String(end - start + 1));
+                createReadStream(path, { start, end }).pipe(res);
+                return;
+            }
+        }
+        res.statusCode = 416;
+        res.setHeader("Content-Range", `bytes */${info.size}`);
+        res.end();
+        return;
+    }
+
+    res.statusCode = 200;
+    res.setHeader("Content-Length", String(info.size));
+    createReadStream(path).pipe(res);
+}
+
 async function ensureViewerApiServer() {
     if (viewerApiServer && viewerApiPort) return { port: viewerApiPort, token: viewerApiToken };
     if (viewerApiStart) return viewerApiStart;
@@ -433,8 +656,9 @@ async function ensureViewerApiServer() {
     viewerApiStart = new Promise((resolve, reject) => {
         const server = createServer(async (req, res) => {
             const { origin } = req.headers;
+            const ownOrigin = viewerApiPort ? `http://127.0.0.1:${viewerApiPort}` : "";
             if (!origin || origin === "null") res.setHeader("Access-Control-Allow-Origin", origin ?? "null");
-            res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+            res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
             res.setHeader("Access-Control-Allow-Headers", "Content-Type");
             res.setHeader("Access-Control-Allow-Private-Network", "true");
 
@@ -449,13 +673,36 @@ async function ensureViewerApiServer() {
                 return;
             }
 
-            if (origin && origin !== "null") {
+            if (origin && origin !== "null" && origin !== ownOrigin) {
                 sendApiJson(res, 403, { ok: false, error: "Invalid origin" });
                 return;
             }
 
-            const route = req.url?.split("?", 1)[0];
-            if (req.method !== "POST" || !new Set(["/delete", "/health", "/repair"]).has(route ?? "")) {
+            const parsed = new URL(req.url ?? "/", ownOrigin || "http://127.0.0.1");
+            const route = parsed.pathname;
+
+            if (req.method === "GET" && route === "/viewer") {
+                if (parsed.searchParams.get("token") !== viewerApiToken) {
+                    res.statusCode = 403;
+                    res.end("Invalid viewer token");
+                    return;
+                }
+                const ids = await listArchivedChannelIds();
+                const channels = await readViewerMetadataMap(ids);
+                const html = buildModernViewerHtml([], "/archive/", viewerApiPort, viewerApiToken, channels, archiveRoot());
+                res.statusCode = 200;
+                res.setHeader("Content-Type", "text/html; charset=utf-8");
+                res.setHeader("Cache-Control", "no-store");
+                res.end(html);
+                return;
+            }
+
+            if (req.method === "GET" && route.startsWith("/archive/")) {
+                await serveArchiveFile(req, res, route.slice("/archive/".length));
+                return;
+            }
+
+            if (req.method !== "POST" || !new Set(["/delete", "/health", "/repair", "/bootstrap"]).has(route)) {
                 sendApiJson(res, 404, { ok: false, error: "Not found" });
                 return;
             }
@@ -474,6 +721,10 @@ async function ensureViewerApiServer() {
                 }
                 if (route === "/repair") {
                     sendApiJson(res, 200, await repairArchiveInternal());
+                    return;
+                }
+                if (route === "/bootstrap") {
+                    sendApiJson(res, 200, { ok: true, archive: await getViewerBootstrapInternal() });
                     return;
                 }
 
@@ -651,6 +902,7 @@ async function getArchiveHealthInternal() {
     partialFiles += assets.partialFiles;
     return {
         checkedAt: new Date().toISOString(),
+        archiveRoot: archiveRoot(),
         channelCount: ids.length,
         totalMessages,
         corruptMessages,
@@ -697,6 +949,9 @@ async function repairArchiveInternal() {
     for (const channelId of ids) {
         try {
             const meta = JSON.parse(await readFile(join(channelDir(channelId), "meta.json"), "utf8"));
+            // Repair is also a crash-recovery path: fold append-only rescue packs into canonical
+            // message files before rebuilding viewer indexes.
+            await compactCapturePacksInternal(channelId);
             await queueViewerOp(channelId, async () => {
                 await writeMetaJs(channelId, meta);
                 await compactViewerDataInner(channelId);
@@ -708,14 +963,130 @@ async function repairArchiveInternal() {
     return { ok: true, removedTransientFiles, rebuiltChannels, health: await getArchiveHealthInternal() };
 }
 
+async function readViewerMetadataMap(ids: string[]) {
+    const channels: Record<string, unknown> = {};
+    for (const channelId of ids) {
+        try {
+            channels[channelId] = JSON.parse(await readFile(join(channelDir(channelId), "meta.json"), "utf8"));
+        } catch { }
+    }
+    return channels;
+}
+
+async function rotateCaptureFiles(channelId: string) {
+    return queueCaptureOp(channelId, async () => {
+        const dir = captureDir(channelId);
+        await mkdir(dir, { recursive: true });
+        const active = activeCapturePath(channelId);
+        try {
+            const info = await stat(active);
+            if (info.isFile() && info.size > 0) {
+                const processing = join(dir, `history.processing-${Date.now()}-${randomBytes(4).toString("hex")}.ndjson`);
+                await rename(active, processing);
+            }
+        } catch { }
+
+        const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+        return entries
+            .filter(entry => entry.isFile() && /^history\.processing-.+\.ndjson$/.test(entry.name))
+            .map(entry => join(dir, entry.name));
+    });
+}
+
+async function compactCapturePacksInternal(channelId: string) {
+    if (await isChannelArchiveDeletedInternal(channelId)) return { packs: 0, saved: 0 };
+    const files = await rotateCaptureFiles(channelId);
+    let packs = 0;
+    let saved = 0;
+
+    for (const path of files) {
+        let completed = false;
+        try {
+            const reader = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
+            for await (const rawLine of reader) {
+                const line = rawLine.trim();
+                if (!line) continue;
+                const records = JSON.parse(line);
+                if (!Array.isArray(records)) throw new Error("Invalid capture-pack line");
+                for (let start = 0; start < records.length; start += MAX_BATCH_MESSAGES) {
+                    const chunk = records.slice(start, start + MAX_BATCH_MESSAGES);
+                    const result = await saveMessagesBatch(null as unknown as IpcMainInvokeEvent, channelId, JSON.stringify(chunk), false);
+                    if (result?.deleted) return { packs, saved };
+                    saved += Number(result?.saved ?? 0);
+                }
+            }
+            completed = true;
+            packs++;
+        } catch (error) {
+            console.warn(`[LocalGroupArchive] Could not compact capture pack ${path}`, error);
+        } finally {
+            if (completed) await rm(path, { force: true }).catch(() => { });
+        }
+    }
+
+    return { packs, saved };
+}
+
+async function hasPendingCapturePacks(channelId: string) {
+    try {
+        const active = await stat(activeCapturePath(channelId));
+        if (active.isFile() && active.size > 0) return true;
+    } catch { }
+    try {
+        const entries = await readdir(captureDir(channelId), { withFileTypes: true });
+        return entries.some(entry => entry.isFile() && /^history\.processing-.+\.ndjson$/.test(entry.name));
+    } catch {
+        return false;
+    }
+}
+
+async function readViewerMessages(channelId: string) {
+    const [dirtyMarker, pendingCapture] = await Promise.all([
+        stat(viewerDirtyPath(channelId)).then(() => true, () => false),
+        hasPendingCapturePacks(channelId)
+    ]);
+    const dirty = dirtyMarker || pendingCapture;
+    const cached = await readFile(viewerDataJsonPath(channelId), "utf8")
+        .then(raw => {
+            try { return JSON.parse(raw); } catch { return null; }
+        }, () => null);
+    if (!dirty && Array.isArray(cached)) return cached;
+
+    // A crash can leave valid rescue data only in capture/history*.ndjson. Never rebuild the
+    // viewer from stale canonical message files while such packs exist. Rotate/compact them first.
+    if (pendingCapture) await compactCapturePacksInternal(channelId);
+    await queueViewerOp(channelId, () => compactViewerDataInner(channelId));
+    const rebuilt = JSON.parse(await readFile(viewerDataJsonPath(channelId), "utf8"));
+    return Array.isArray(rebuilt) ? rebuilt : [];
+}
+
+async function getViewerBootstrapInternal() {
+    const ids = await listArchivedChannelIds();
+    const channels = await readViewerMetadataMap(ids);
+    const messages: Record<string, unknown[]> = {};
+
+    await Promise.all(ids.map(async channelId => {
+        try {
+            messages[channelId] = await readViewerMessages(channelId);
+        } catch {
+            messages[channelId] = [];
+        }
+    }));
+
+    return { channels, messages };
+}
+
 async function rebuildViewerShell() {
     viewerShellChain = viewerShellChain
         .catch(() => { })
         .then(async () => {
             const ids = await listArchivedChannelIds();
-            const api = await ensureViewerApiServer();
-            await writeFileAtomic(viewerPath(), buildModernViewerHtml(ids, false, api.port, api.token));
-            await writeFileAtomic(shortcutViewerPath(), buildModernViewerHtml(ids, true, api.port, api.token));
+            const [api, channels] = await Promise.all([
+                ensureViewerApiServer(),
+                readViewerMetadataMap(ids)
+            ]);
+            await writeFileAtomic(viewerPath(), buildModernViewerHtml(ids, null, api.port, api.token, channels, archiveRoot()));
+            await writeFileAtomic(shortcutViewerPath(), buildModernViewerHtml(ids, "./DiscordLocalArchive/", api.port, api.token, channels, archiveRoot()));
         });
     return viewerShellChain;
 }
@@ -747,6 +1118,10 @@ async function readDeletionTimestamps(channelId: string) {
 }
 
 async function compactViewerDataInner(channelId: string) {
+    // Turbo history first lands in append-only capture packs. Convert those packs into the
+    // durable per-message/revision layout before rebuilding viewer-data.json. A crash leaves
+    // processing packs behind and this same path recovers them on the next viewer/repair pass.
+    await compactCapturePacksInternal(channelId);
     const dir = messageDir(channelId);
     await mkdir(dir, { recursive: true });
     const entries = await readdir(dir, { withFileTypes: true });
@@ -756,6 +1131,7 @@ async function compactViewerDataInner(channelId: string) {
         .sort((a, b) => snowflakeCompare(a.slice(0, -5), b.slice(0, -5)));
 
     const deletions = await readDeletionTimestamps(channelId);
+    const records: any[] = [];
     const lines: string[] = [
         `window.__LGA=window.__LGA||{channels:{},messages:{}};window.__LGA.messages[${jsSafeJson(channelId)}]=[];`
     ];
@@ -765,12 +1141,17 @@ async function compactViewerDataInner(channelId: string) {
             const record = JSON.parse(raw);
             const deletedAt = deletions.get(String(record?.id ?? ""));
             if (deletedAt) record.deletedAt = deletedAt;
+            records.push(record);
             lines.push(`window.__LGA.messages[${jsSafeJson(channelId)}].push(${jsSafeJson(record)});`);
         } catch {
             // Ignore a malformed/partially-written legacy message instead of breaking the whole viewer.
         }
     }
-    await writeFileAtomic(join(channelDir(channelId), "data.js"), lines.join("\n") + "\n");
+    await Promise.all([
+        writeFileAtomic(join(channelDir(channelId), "data.js"), lines.join("\n") + "\n"),
+        writeFileAtomic(viewerDataJsonPath(channelId), JSON.stringify(records))
+    ]);
+    await rm(viewerDirtyPath(channelId), { force: true }).catch(() => { });
 }
 
 export async function restoreChannelArchive(_: IpcMainInvokeEvent, channelId: string) {
@@ -801,28 +1182,137 @@ export async function ensureChannel(_: IpcMainInvokeEvent, channelId: string, me
     const meta = JSON.parse(metadataJson);
     if (await isChannelArchiveDeletedInternal(channelId)) return false;
     const dir = channelDir(channelId);
-    await mkdir(messageDir(channelId), { recursive: true });
-    await mkdir(join(dir, "attachments"), { recursive: true });
-    await mkdir(join(dir, "deletions"), { recursive: true });
-    await mkdir(join(dir, "revisions"), { recursive: true });
-    for (const kind of ASSET_KINDS) await mkdir(assetDir(kind), { recursive: true });
+    await Promise.all([
+        mkdir(messageDir(channelId), { recursive: true }),
+        mkdir(join(dir, "attachments"), { recursive: true }),
+        mkdir(join(dir, "deletions"), { recursive: true }),
+        mkdir(join(dir, "revisions"), { recursive: true }),
+        mkdir(captureDir(channelId), { recursive: true }),
+        ...[...ASSET_KINDS].map(kind => mkdir(assetDir(kind), { recursive: true }))
+    ]);
     await writeFileAtomic(join(dir, "meta.json"), metadataJson);
 
-    await writeMetaJs(channelId, meta);
     if (deletedChannels.has(channelId)) {
         await rm(dir, { recursive: true, force: true });
         return false;
     }
-    await rebuildViewerShell();
+
+    // The rescue path only needs meta.json + directories before REST starts. Legacy meta.js and
+    // the global viewer shell are presentation work, so never put them on the capture stopwatch.
+    void Promise.all([writeMetaJs(channelId, meta), rebuildViewerShell()]).catch(error => {
+        console.warn(`[LocalGroupArchive] Deferred viewer metadata refresh failed for ${channelId}`, error);
+    });
     return true;
 }
 
-export async function saveMessagesBatch(
+export async function appendCaptureBatch(
     _: IpcMainInvokeEvent,
     channelId: string,
     recordsJson: string
 ) {
     assertSnowflake(channelId, "channel id");
+    if (await isChannelArchiveDeletedInternal(channelId)) return { ok: false, saved: 0, deleted: true };
+    if (typeof recordsJson !== "string" || Buffer.byteLength(recordsJson, "utf8") > MAX_BATCH_BYTES) {
+        throw new Error("Invalid capture-pack JSON payload");
+    }
+
+    const records = JSON.parse(recordsJson);
+    if (!Array.isArray(records) || records.length > MAX_BATCH_MESSAGES) throw new Error("Invalid capture-pack batch");
+    for (const record of records) {
+        const id = String(record?.id ?? "");
+        assertSnowflake(id, "message id");
+        if (String(record?.channelId ?? "") !== channelId) throw new Error("Message/channel mismatch");
+        // The whole capture batch is already capped at MAX_BATCH_BYTES. Avoid re-stringifying every
+        // record on the latency-critical rescue path; full per-record validation runs again during
+        // background compaction before canonical message files are written.
+    }
+    if (!records.length) return { ok: true, saved: 0 };
+
+    await queueCaptureOp(channelId, async () => {
+        if (deletedChannels.has(channelId)) return;
+        await mkdir(captureDir(channelId), { recursive: true });
+        // One append per REST page replaces up to 100 atomic JSON writes on the rescue path.
+        // NDJSON makes every completed append independently recoverable after a crash. The viewer
+        // detects pending capture files directly, so no extra atomic dirty-marker write is needed
+        // for every page.
+        await appendFile(activeCapturePath(channelId), `${recordsJson}\n`, "utf8");
+    });
+
+    if (deletedChannels.has(channelId)) return { ok: false, saved: 0, deleted: true };
+    return { ok: true, saved: records.length };
+}
+
+export async function getCaptureCoverage(_: IpcMainInvokeEvent, channelId: string) {
+    assertSnowflake(channelId, "channel id");
+    if (await isChannelArchiveDeletedInternal(channelId)) return null;
+    try {
+        const raw = await readFile(captureCoveragePath(channelId), "utf8");
+        if (Buffer.byteLength(raw, "utf8") > MAX_COVERAGE_BYTES) return null;
+        const value = JSON.parse(raw);
+        return value && typeof value === "object" ? value : null;
+    } catch {
+        return null;
+    }
+}
+
+export async function saveCaptureCoverage(
+    _: IpcMainInvokeEvent,
+    channelId: string,
+    coverageJson: string
+) {
+    assertSnowflake(channelId, "channel id");
+    if (await isChannelArchiveDeletedInternal(channelId)) return false;
+    if (typeof coverageJson !== "string" || Buffer.byteLength(coverageJson, "utf8") > MAX_COVERAGE_BYTES) {
+        throw new Error("Invalid capture coverage payload");
+    }
+    const coverage = JSON.parse(coverageJson);
+    if (!coverage || coverage.version !== 1 || String(coverage.channelId ?? "") !== channelId
+        || !SNOWFLAKE.test(String(coverage.frozenNewest ?? ""))
+        || !SNOWFLAKE.test(String(coverage.frozenBefore ?? ""))
+        || snowflakeCompare(String(coverage.frozenNewest), String(coverage.frozenBefore)) <= 0
+        || !Array.isArray(coverage.segments) || coverage.segments.length < 1 || coverage.segments.length > 128
+        || !coverage.segments.every((segment: any) => segment
+            && typeof segment.id === "string" && segment.id.length > 0 && segment.id.length <= 80
+            && new Set(["normal", "channel-search", "global-search"]).has(segment.plane)
+            && new Set(["pending", "complete"]).has(segment.status)
+            && (segment.upperExclusive == null || SNOWFLAKE.test(String(segment.upperExclusive)))
+            && (segment.lowerExclusive == null || SNOWFLAKE.test(String(segment.lowerExclusive)))
+            && (segment.upperExclusive == null || segment.lowerExclusive == null
+                || snowflakeCompare(String(segment.upperExclusive), String(segment.lowerExclusive)) > 0))) {
+        throw new Error("Invalid capture coverage ledger");
+    }
+
+    await queueCaptureOp(channelId, async () => {
+        if (deletedChannels.has(channelId)) return;
+        await mkdir(captureDir(channelId), { recursive: true });
+        await writeFileAtomic(captureCoveragePath(channelId), coverageJson);
+    });
+    return !deletedChannels.has(channelId);
+}
+
+export async function clearCaptureCoverage(_: IpcMainInvokeEvent, channelId: string) {
+    assertSnowflake(channelId, "channel id");
+    await queueCaptureOp(channelId, () => rm(captureCoveragePath(channelId), { force: true }));
+    return true;
+}
+
+export async function compactCapturePacks(_: IpcMainInvokeEvent, channelId: string) {
+    assertSnowflake(channelId, "channel id");
+    const result = await compactCapturePacksInternal(channelId);
+    if (result.packs && !await isChannelArchiveDeletedInternal(channelId)) {
+        await queueViewerOp(channelId, () => compactViewerDataInner(channelId));
+    }
+    return result;
+}
+
+export async function saveMessagesBatch(
+    _: IpcMainInvokeEvent,
+    channelId: string,
+    recordsJson: string,
+    appendViewer = true
+) {
+    assertSnowflake(channelId, "channel id");
+    if (typeof appendViewer !== "boolean") throw new Error("Invalid viewer append flag");
     if (await isChannelArchiveDeletedInternal(channelId)) return { ok: false, saved: 0, deleted: true };
     if (typeof recordsJson !== "string" || Buffer.byteLength(recordsJson, "utf8") > MAX_BATCH_BYTES) {
         throw new Error("Invalid batch JSON payload");
@@ -842,55 +1332,69 @@ export async function saveMessagesBatch(
         return { id, record };
     });
 
-    let saved = 0;
-    let deleted = false;
-    await queueViewerOp(channelId, async () => {
-        await mkdir(messageDir(channelId), { recursive: true });
-        await ensureFile(
-            join(channelDir(channelId), "data.js"),
-            `window.__LGA=window.__LGA||{channels:{},messages:{}};window.__LGA.messages[${jsSafeJson(channelId)}]=window.__LGA.messages[${jsSafeJson(channelId)}]||[];\n`
-        );
+    await mkdir(messageDir(channelId), { recursive: true });
+    const [knownIds, deletionTimestamps] = await Promise.all([
+        getKnownMessageIds(channelId),
+        getDeletionTimestampCache(channelId)
+    ]);
 
-        for (const { id, record } of validated) {
-            if (deletedChannels.has(channelId)) {
-                deleted = true;
-                break;
-            }
+    // Message files are independent, so write them through a global high-throughput
+    // pool instead of serializing an entire 100-message REST page behind data.js.
+    // Only the tiny viewer append remains ordered per channel.
+    const results = await Promise.all(validated.map(({ id, record }) => withMessageWriteSlot(async () => {
+        if (deletedChannels.has(channelId)) return false;
 
-            const destination = join(messageDir(channelId), `${id}.json`);
-            try {
-                const deletion = JSON.parse(await readFile(deletionPath(channelId, id), "utf8"));
-                record.deletedAt = String(deletion?.deletedAt ?? "");
-            } catch { }
+        const destination = join(messageDir(channelId), `${id}.json`);
+        const deletedAt = deletionTimestamps.get(id);
+        if (deletedAt) record.deletedAt = deletedAt;
+
+        if (knownIds.has(id)) {
             try {
                 const previous = JSON.parse(await readFile(destination, "utf8"));
                 if (revisionSignature(previous) !== revisionSignature(record)) {
                     const revisions = revisionDir(channelId, id);
                     await mkdir(revisions, { recursive: true });
                     const revisionName = `${Date.now()}-${randomBytes(4).toString("hex")}.json`;
-                    await writeFileAtomic(join(revisions, revisionName), JSON.stringify(previous, null, 2));
+                    await writeFileAtomic(join(revisions, revisionName), JSON.stringify(previous));
                 }
             } catch { }
-
-            await writeFileAtomic(destination, JSON.stringify(record, null, 2));
-            saved++;
         }
 
-        if (deletedChannels.has(channelId)) {
-            deleted = true;
-            await rm(channelDir(channelId), { recursive: true, force: true });
-            return;
-        }
+        await writeFileAtomic(destination, JSON.stringify(record));
+        knownIds.add(id);
+        return true;
+    })));
 
-        const appendText = validated.slice(0, saved)
-            .map(({ record }) => `window.__LGA.messages[${jsSafeJson(channelId)}].push(${jsSafeJson(record)});`)
-            .join("\n") + (saved ? "\n" : "");
-        if (appendText) await appendFile(join(channelDir(channelId), "data.js"), appendText, "utf8");
-    });
+    const savedRecords = validated.filter((_, index) => results[index]);
+    const saved = savedRecords.length;
+    const deleted = deletedChannels.has(channelId);
 
-    return deleted
-        ? { ok: false, saved: 0, deleted: true }
-        : { ok: true, saved };
+    if (deleted) {
+        await queueViewerOp(channelId, () => rm(channelDir(channelId), { recursive: true, force: true }));
+        return { ok: false, saved: 0, deleted: true };
+    }
+
+    if (!appendViewer && savedRecords.length) {
+        // Fast capture intentionally skips thousands of incremental data.js appends. Persist a
+        // tiny dirty marker so the viewer can expose the group immediately and rebuild that
+        // channel's message index in the background instead of blocking the whole shell.
+        await writeFileAtomic(viewerDirtyPath(channelId), "dirty\n");
+    }
+
+    if (appendViewer && savedRecords.length) {
+        await queueViewerOp(channelId, async () => {
+            await ensureFile(
+                join(channelDir(channelId), "data.js"),
+                `window.__LGA=window.__LGA||{channels:{},messages:{}};window.__LGA.messages[${jsSafeJson(channelId)}]=window.__LGA.messages[${jsSafeJson(channelId)}]||[];\n`
+            );
+            const appendText = savedRecords
+                .map(({ record }) => `window.__LGA.messages[${jsSafeJson(channelId)}].push(${jsSafeJson(record)});`)
+                .join("\n") + "\n";
+            await appendFile(join(channelDir(channelId), "data.js"), appendText, "utf8");
+        });
+    }
+
+    return { ok: true, saved };
 }
 
 export async function deleteMessage(_: IpcMainInvokeEvent, channelId: string, messageId: string) {
@@ -903,6 +1407,8 @@ export async function deleteMessage(_: IpcMainInvokeEvent, channelId: string, me
         const dir = join(channelDir(channelId), "deletions");
         await mkdir(dir, { recursive: true });
         await writeFileAtomic(deletionPath(channelId, messageId), JSON.stringify({ messageId, deletedAt }, null, 2));
+        const deletionCache = deletionTimestampCaches.get(channelId);
+        deletionCache?.set(messageId, deletedAt);
 
         try {
             const path = join(messageDir(channelId), `${messageId}.json`);
@@ -997,31 +1503,96 @@ export async function getChannelArchiveBounds(_: IpcMainInvokeEvent, channelId: 
     return getChannelArchiveBoundsInternal(channelId);
 }
 
+export async function isHistoryComplete(_: IpcMainInvokeEvent, channelId: string) {
+    assertSnowflake(channelId, "channel id");
+    if (await isChannelArchiveDeletedInternal(channelId)) return false;
+    try {
+        await stat(historyCompletePath(channelId));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export async function markHistoryComplete(_: IpcMainInvokeEvent, channelId: string) {
+    assertSnowflake(channelId, "channel id");
+    if (await isChannelArchiveDeletedInternal(channelId)) return false;
+    await mkdir(channelDir(channelId), { recursive: true });
+    await writeFileAtomic(historyCompletePath(channelId), `${new Date().toISOString()}\n`);
+    return true;
+}
+
 export async function repairArchive(_: IpcMainInvokeEvent) {
     return repairArchiveInternal();
 }
 
 export async function prepareViewer(_: IpcMainInvokeEvent) {
     const ids = await listArchivedChannelIds();
+    const rebuildIds: string[] = [];
+    let visibleChannels = 0;
 
+    // Phase 1 is deliberately tiny: expose every valid channel to the HTML shell first.
+    // Never make the group list wait for a 10k+ message compaction pass.
     for (const channelId of ids) {
         try {
-            const metaRaw = await readFile(join(channelDir(channelId), "meta.json"), "utf8");
+            const dir = channelDir(channelId);
+            const metaRaw = await readFile(join(dir, "meta.json"), "utf8");
+            const dataPath = join(dir, "data.js");
+            const [dataInfo, dirty, pendingCapture] = await Promise.all([
+                stat(dataPath).catch(() => null),
+                stat(viewerDirtyPath(channelId)).then(() => true, () => false),
+                hasPendingCapturePacks(channelId)
+            ]);
+
             await writeMetaJs(channelId, JSON.parse(metaRaw));
-            await queueViewerOp(channelId, () => compactViewerDataInner(channelId));
+            visibleChannels++;
+
+            // v0.5.5+ writes an explicit dirty marker for deferred viewer batches. Zero-byte
+            // data.js also catches older fast-capture archives that never finished compaction.
+            if (pendingCapture || dirty || !dataInfo || dataInfo.size === 0) rebuildIds.push(channelId);
         } catch {
-            // Ignore incomplete legacy folders.
+            // Ignore incomplete legacy folders, but never let one bad channel hide the others.
         }
     }
 
     await rebuildViewerShell();
-    return { channels: ids.length };
+
+    // Phase 2 is background-only. Groups are already visible and usable while heavy message
+    // indexes repair themselves one channel at a time.
+    for (const channelId of rebuildIds) {
+        void (async () => {
+            // Recover NDJSON rescue packs before indexing so a viewer opened immediately after a
+            // crash/kick cannot silently display an older canonical snapshot.
+            if (await hasPendingCapturePacks(channelId)) await compactCapturePacksInternal(channelId);
+            await queueViewerOp(channelId, () => compactViewerDataInner(channelId));
+        })().catch(error => {
+            console.warn(`[LocalGroupArchive] Background viewer rebuild failed for ${channelId}`, error);
+        });
+    }
+
+    return { channels: visibleChannels, rebuilding: rebuildIds.length, archiveRoot: archiveRoot() };
 }
 
-export async function openArchiveViewer(_: IpcMainInvokeEvent) {
-    await rebuildViewerShell();
-    const result = await shell.openPath(shortcutViewerPath());
-    return result === "";
+export async function openArchiveViewer(event: IpcMainInvokeEvent) {
+    // Always open the live localhost viewer. This removes file:// loading differences and stale
+    // shortcut/cache problems while keeping the generated HTML as an offline fallback.
+    await prepareViewer(event);
+    const api = await ensureViewerApiServer();
+    await shell.openExternal(viewerHttpUrl(api.port, api.token));
+    return true;
+}
+
+export async function openArchiveViewerForChannel(event: IpcMainInvokeEvent, channelId: string, removed = true) {
+    assertSnowflake(channelId, "channel id");
+    await prepareViewer(event);
+    const api = await ensureViewerApiServer();
+    await shell.openExternal(viewerHttpUrl(api.port, api.token, channelId, removed));
+    return true;
+}
+
+export async function getArchivedChannelMetadata(_: IpcMainInvokeEvent) {
+    const ids = await listArchivedChannelIds();
+    return readViewerMetadataMap(ids);
 }
 
 export async function openArchiveFolder(_: IpcMainInvokeEvent) {

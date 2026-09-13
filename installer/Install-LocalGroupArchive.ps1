@@ -14,7 +14,8 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$ProductVersion = "0.5.0"
+$ProductVersion = "0.9.1"
+$PinnedVencordCommit = "0850f37fbb1623aa6330764d8f4b1e0b2617dcdf"
 $InstallRoot = Join-Path $env:LOCALAPPDATA "LocalGroupArchive"
 $ToolsRoot = Join-Path $InstallRoot "tools"
 $NodeRoot = Join-Path $ToolsRoot "node"
@@ -54,16 +55,32 @@ function Invoke-Logged {
         [Parameter(Mandatory = $true)][string]$Label
     )
 
+    if (!(Test-Path -LiteralPath $FilePath)) {
+        throw "Required executable was not found: $FilePath"
+    }
+
     Write-Step $Label
     Push-Location $WorkingDirectory
     try {
+        # Native tools such as pnpm may write normal progress/lifecycle lines to stderr.
+        # With the installer's global ErrorActionPreference=Stop, PowerShell 5.1 can
+        # promote those stderr records to terminating errors before the process exits.
+        # Temporarily keep native stderr non-terminating, merge it into the log, and
+        # decide success strictly from the native process exit code instead.
+        $previousErrorActionPreference = $ErrorActionPreference
         $global:LASTEXITCODE = 0
-        & $FilePath @Arguments 2>&1 | ForEach-Object {
-            $line = [string]$_
-            Write-Host ("     " + $line)
-            Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
+        try {
+            $ErrorActionPreference = "Continue"
+            & $FilePath @Arguments 2>&1 | ForEach-Object {
+                $line = [string]$_
+                Write-Host ("     " + $line)
+                Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
+            }
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
         }
-        $exitCode = $LASTEXITCODE
+
         if ($null -eq $exitCode) { $exitCode = 0 }
         if ($exitCode -ne 0) { throw "$Label failed with exit code $exitCode." }
     } finally {
@@ -129,14 +146,15 @@ function Install-PortableNode {
 }
 
 function Get-FreshVencordSource {
-    Write-Step "Downloading the latest official Vencord source"
-    $headers = @{ "User-Agent" = "LocalGroupArchive-Installer/$ProductVersion"; "Accept" = "application/vnd.github+json" }
-    $head = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/Vendicated/Vencord/commits/main" -Headers $headers
-    $commit = [string]$head.sha
-    if ($commit -notmatch '^[A-Fa-f0-9]{40}$') { throw "GitHub did not return a valid Vencord commit SHA." }
+    Write-Step "Downloading the tested official Vencord source"
+    # v0.7 patches Discord's private-DM list. Pin the exact upstream commit that
+    # CI builds and the release was validated against instead of silently
+    # compiling against a future Vencord main whose minified patch seam may drift.
+    $commit = [string]$PinnedVencordCommit
+    if ($commit -notmatch '^[A-Fa-f0-9]{40}$') { throw "The pinned Vencord commit SHA is invalid." }
     $script:VencordCommit = $commit.ToLowerInvariant()
 
-    $archivePath = Join-Path $StagingRoot "Vencord-main.zip"
+    $archivePath = Join-Path $StagingRoot "Vencord-$($commit.Substring(0, 12)).zip"
     Save-RemoteFile "https://github.com/Vendicated/Vencord/archive/$commit.zip" $archivePath
     $extractRoot = Join-Path $StagingRoot "vencord-extracted"
     Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot -Force
@@ -162,7 +180,7 @@ function Get-FreshVencordSource {
         $script:BackupCreated = $true
     }
     Move-Item -LiteralPath $newRoot -Destination $VencordRoot
-    Write-Okay "Official Vencord source is ready at commit $($commit.Substring(0, 12))"
+    Write-Okay "Tested official Vencord source is ready at commit $($commit.Substring(0, 12))"
 }
 
 function Install-VerifiedVencordInjector {

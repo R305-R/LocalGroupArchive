@@ -1,6 +1,6 @@
 #define MyAppName "LocalGroupArchive"
 #ifndef AppVersion
-  #define AppVersion "0.5.0"
+  #define AppVersion "0.9.1"
 #endif
 #define MyAppVersion AppVersion
 #define MyAppPublisher "Faisal"

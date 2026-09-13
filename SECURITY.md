@@ -11,7 +11,7 @@ Please open a private GitHub security advisory for vulnerabilities that could ex
 - Download size is bounded, redirects are revalidated, incomplete files use unique names, and stopped/deleted channels abort active streams.
 - The viewer builds message content with DOM text nodes rather than assigning archived content to `innerHTML`.
 - Only a small allowlist of raster image/audio/video formats is previewed; HTML, SVG, and other active attachment types are offered as downloads instead of being opened inline.
-- The deletion helper binds only to `127.0.0.1`, requires a random per-session token, rejects non-null web origins, and stops with the plugin.
+- The viewer/API helper binds only to `127.0.0.1`, requires a random per-session token for the viewer/API, accepts only `null` or its own loopback origin, and stops with the plugin. Archive file serving is path-contained to the detected archive root.
 - Installer Node.js archives are checked against Node's official SHA-256 list. The Vencord source URL is pinned to the commit SHA returned by GitHub, and the official Vencord CLI is checked against its published checksum list. Updates are checked against the checksum asset produced by the release workflow.
 
 ## User responsibility

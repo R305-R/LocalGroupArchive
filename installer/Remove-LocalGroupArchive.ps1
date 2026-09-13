@@ -49,9 +49,16 @@ try {
     try {
         $env:VENCORD_USER_DATA_DIR = $null
         $env:VENCORD_DEV_INSTALL = $null
+        $previousErrorActionPreference = $ErrorActionPreference
         $global:LASTEXITCODE = 0
-        & $Injector --repair --branch $branch
-        if ($LASTEXITCODE -ne 0) { throw "Restoring regular Vencord failed with exit code $LASTEXITCODE." }
+        try {
+            $ErrorActionPreference = "Continue"
+            & $Injector --repair --branch $branch 2>&1 | ForEach-Object { Write-Host ([string]$_) }
+            $injectorExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($injectorExitCode -ne 0) { throw "Restoring regular Vencord failed with exit code $injectorExitCode." }
     } finally {
         $env:VENCORD_USER_DATA_DIR = $oldUserData
         $env:VENCORD_DEV_INSTALL = $oldDevInstall

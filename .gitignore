@@ -4,3 +4,7 @@ node_modules/
 *.tmp
 *.part
 .DS_Store
+
+# Local smoke-test scratch output
+viewer-test.html
+viewer.cjs
