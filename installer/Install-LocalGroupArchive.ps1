@@ -7,19 +7,21 @@ param(
     [string]$Repository = "OWNER/LocalGroupArchive",
     [ValidateSet("auto", "stable", "ptb", "canary")]
     [string]$DiscordBranch = "auto",
-    [switch]$SkipInject
+    [switch]$SkipInject,
+    [string]$ResultFile = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$ProductVersion = "0.9.1"
+$ProductVersion = "0.9.2"
 $PinnedVencordCommit = "0850f37fbb1623aa6330764d8f4b1e0b2617dcdf"
 $InstallRoot = Join-Path $env:LOCALAPPDATA "LocalGroupArchive"
 $ToolsRoot = Join-Path $InstallRoot "tools"
 $NodeRoot = Join-Path $ToolsRoot "node"
 $PnpmRoot = Join-Path $ToolsRoot "pnpm"
+$PnpmStoreRoot = Join-Path $ToolsRoot "pnpm-store"
 $InjectorPath = Join-Path $ToolsRoot "VencordInstallerCli.exe"
 $VencordRoot = Join-Path $InstallRoot "Vencord"
 $RollbackRoot = Join-Path $InstallRoot "rollback"
@@ -45,6 +47,32 @@ function Write-Okay([string]$Message) {
 function Write-Warn([string]$Message) {
     Write-Host ("  [!] " + $Message) -ForegroundColor Yellow
     Add-Content -LiteralPath $LogFile -Value ("[WARN] " + $Message) -Encoding UTF8
+}
+
+function Write-InstallerResult {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("SUCCESS", "FAILED")][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ResultFile)) { return }
+
+    $resultDirectory = Split-Path -Parent $ResultFile
+    if (![string]::IsNullOrWhiteSpace($resultDirectory)) {
+        New-Item -ItemType Directory -Path $resultDirectory -Force | Out-Null
+    }
+
+    $details = @(
+        "Status: $Status",
+        "Message: $Message",
+        "Log: $LogFile"
+    )
+    if ($Status -eq "FAILED" -and (Test-Path -LiteralPath $LogFile)) {
+        $details += ""
+        $details += "Last log lines:"
+        $details += @(Get-Content -LiteralPath $LogFile -Tail 14)
+    }
+    $details | Set-Content -LiteralPath $ResultFile -Encoding UTF8
 }
 
 function Invoke-Logged {
@@ -240,6 +268,52 @@ function Install-PnpmForVencord {
     return $pnpm
 }
 
+function Reset-VencordNodeModules {
+    $nodeModules = Join-Path $VencordRoot "node_modules"
+    if (!(Test-Path -LiteralPath $nodeModules)) { return }
+
+    Write-Warn "Resetting the incomplete Vencord node_modules tree before the final retry"
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $nodeModules -Recurse -Force
+            return
+        } catch {
+            if ($attempt -eq 4) {
+                throw "Could not reset the incomplete node_modules tree: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds $attempt
+        }
+    }
+}
+
+function Install-VencordDependencies([string]$Pnpm) {
+    # Windows Defender and filesystem filter drivers can briefly lock a freshly linked
+    # package while pnpm is finalising node_modules (observed as UNKNOWN/-4094). Use an
+    # isolated verified store, copy imports instead of hardlinks, and retry the bounded
+    # operation. The final attempt starts from a clean node_modules tree.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $arguments = @(
+            "install",
+            "--frozen-lockfile",
+            "--store-dir", $PnpmStoreRoot,
+            "--package-import-method=copy",
+            "--reporter=append-only"
+        )
+        if ($attempt -gt 1) { $arguments += "--force" }
+
+        try {
+            Invoke-Logged $Pnpm $arguments $VencordRoot "Installing verified Vencord dependencies (attempt $attempt/3)"
+            return
+        } catch {
+            $failure = [string]$_.Exception.Message
+            if ($attempt -eq 3) { throw }
+            Write-Warn "Dependency installation hit a transient Windows filesystem error: $failure"
+            if ($attempt -eq 2) { Reset-VencordNodeModules }
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+}
+
 function Build-And-Inject([string]$Pnpm, [string]$Injector) {
     $oldPath = $env:Path
     $oldVencordUserData = $env:VENCORD_USER_DATA_DIR
@@ -252,7 +326,7 @@ function Build-And-Inject([string]$Pnpm, [string]$Injector) {
     $env:VENCORD_HASH = $VencordCommit.Substring(0, 7)
     $env:VENCORD_REMOTE = "Vendicated/Vencord"
     try {
-        Invoke-Logged $Pnpm @("install", "--frozen-lockfile") $VencordRoot "Installing verified Vencord dependencies"
+        Install-VencordDependencies $Pnpm
         Invoke-Logged $Pnpm @("build", "--disable-updater") $VencordRoot "Building developer Vencord with LocalGroupArchive"
         if (!$SkipInject) {
             if (!$Injector -or !(Test-Path -LiteralPath $Injector)) { throw "The verified Vencord CLI installer is missing." }
@@ -321,6 +395,7 @@ try {
     Prune-OldRollbacks
 
     Write-Okay "Installation completed"
+    Write-InstallerResult "SUCCESS" "Installation completed successfully."
     Write-Host ""
     Write-Host "  Developer Vencord was injected automatically into Discord ($DiscordBranch)." -ForegroundColor Green
     Write-Host "  Open/restart Discord. The live spotlight will guide you to enable the plugin." -ForegroundColor Green
@@ -336,6 +411,7 @@ try {
     Write-Host ""
     Write-Host ("  Installation failed: " + $message) -ForegroundColor Red
     Write-Host ("  Details: " + $LogFile) -ForegroundColor Yellow
+    try { Write-InstallerResult "FAILED" $message } catch { }
     exit 1
 } finally {
     if (Test-Path -LiteralPath $StagingRoot) {

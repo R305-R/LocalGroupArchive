@@ -19,6 +19,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: End-to-end installer engine test
+        shell: powershell
+        run: |
+          $result = Join-Path $env:RUNNER_TEMP "LocalGroupArchive-install-result.txt"
+          & .\installer\Install-LocalGroupArchive.ps1 -Action Install -PayloadRoot .\plugin -Repository $env:GITHUB_REPOSITORY -SkipInject -ResultFile $result
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path -LiteralPath $result) { Get-Content -LiteralPath $result }
+            throw "Installer engine failed with exit code $LASTEXITCODE"
+          }
       - name: Validate release version
         shell: pwsh
         run: |

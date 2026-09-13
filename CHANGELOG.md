@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.2
+
+- Fixed the Windows installer failure observed after pnpm finished linking 561 packages and then returned `UNKNOWN/-4094` while opening `node_modules/diff/package.json`.
+- Dependency installation now uses a LocalGroupArchive-owned pnpm store and copy imports instead of shared hardlinks, reducing interference from filesystem filters and antivirus scanners.
+- Added three bounded dependency-install attempts with backoff. Later attempts force relinking, and the final attempt safely removes only the incomplete managed `Vencord/node_modules` tree before rebuilding it.
+- Added an installer result channel. Inno Setup now shows the real PowerShell error, log path, and recent log lines in its own failure dialog instead of referring to a console window that may already have closed.
+- Added a Windows end-to-end release gate that downloads Node/Vencord, installs dependencies, and builds the bundled plugins with `-SkipInject` before an installer can be published.
+- Kept v0.9.1 Panic Burst, Smart Hybrid, Warm Mirror, archive format, and automatic new-group behavior unchanged.
+
 ## 0.9.1
 
 - Added a **five-second Panic Burst** to every cold Smart Hybrid capture, including automatic protection of a newly-accessible Group DM. Normal history starts at six concurrent lanes immediately and each independent search route may keep two batches in flight during the burst.

@@ -1,6 +1,6 @@
 #define MyAppName "LocalGroupArchive"
 #ifndef AppVersion
-  #define AppVersion "0.9.1"
+  #define AppVersion "0.9.2"
 #endif
 #define MyAppVersion AppVersion
 #define MyAppPublisher "Faisal"
@@ -55,17 +55,28 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
   Params: String;
+  ResultPath: String;
+  ResultText: AnsiString;
 begin
   if CurStep = ssPostInstall then
   begin
+    ResultPath := ExpandConstant('{tmp}\LocalGroupArchive-install-result.txt');
+    DeleteFile(ResultPath);
+    WizardForm.StatusLabel.Caption := 'Installing and validating developer Vencord...';
     Params := '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' +
       ExpandConstant('{app}\installer\Install-LocalGroupArchive.ps1') +
       '" -Action Install -PayloadRoot "' + ExpandConstant('{app}\plugin') +
-      '" -Repository "{#Repository}"';
+      '" -Repository "{#Repository}" -ResultFile "' + ResultPath + '"';
     if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       Params, ExpandConstant('{app}'), SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode) then
       RaiseException('Could not start the LocalGroupArchive setup script.');
     if ResultCode <> 0 then
-      RaiseException('LocalGroupArchive setup failed. Review the PowerShell log path shown on screen.');
+    begin
+      if LoadStringFromFile(ResultPath, ResultText) then
+        RaiseException('LocalGroupArchive setup failed.' + #13#10 + #13#10 + String(ResultText))
+      else
+        RaiseException('LocalGroupArchive setup failed before diagnostics were written.' + #13#10 +
+          'Logs: ' + ExpandConstant('{localappdata}\LocalGroupArchive\logs'));
+    end;
   end;
 end;
