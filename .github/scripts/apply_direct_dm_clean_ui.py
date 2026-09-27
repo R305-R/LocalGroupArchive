@@ -1,0 +1,476 @@
+from pathlib import Path
+import json
+import re
+
+index_path = Path("plugin/LocalGroupArchive/index.ts")
+text = index_path.read_text(encoding="utf-8")
+
+
+def once(old: str, new: str, label: str):
+    global text
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected exactly 1 match, found {count}")
+    text = text.replace(old, new, 1)
+
+
+once(
+    'const PLUGIN_VERSION = "0.9.3";\nconst GROUP_DM_TYPE = 3;',
+    'const PLUGIN_VERSION = "0.9.4";\nconst DM_TYPE = 1;\nconst GROUP_DM_TYPE = 3;',
+    "version and DM constants",
+)
+
+once(
+    '''function isGroupDm(channelId: string) {
+    return ChannelStore.getChannel(channelId)?.type === GROUP_DM_TYPE;
+}
+
+function currentGroupIds() {''',
+    '''function isGroupDm(channelId: string) {
+    return ChannelStore.getChannel(channelId)?.type === GROUP_DM_TYPE;
+}
+
+function isArchiveableDm(channelId: string) {
+    const type = ChannelStore.getChannel(channelId)?.type;
+    return type === DM_TYPE || type === GROUP_DM_TYPE;
+}
+
+function currentGroupIds() {''',
+    "archiveable DM helper",
+)
+
+once(
+    '''function currentGroupIds() {
+    const channels = ChannelStore.getMutablePrivateChannels?.() ?? {};
+    return Object.values(channels)
+        .filter((channel: any) => channel?.type === GROUP_DM_TYPE && channel?.id)
+        .map((channel: any) => String(channel.id));
+}
+
+function currentPrivateChannelSnapshot() {''',
+    '''function currentGroupIds() {
+    const channels = ChannelStore.getMutablePrivateChannels?.() ?? {};
+    return Object.values(channels)
+        .filter((channel: any) => channel?.type === GROUP_DM_TYPE && channel?.id)
+        .map((channel: any) => String(channel.id));
+}
+
+function currentArchiveableDmIds() {
+    const channels = ChannelStore.getMutablePrivateChannels?.() ?? {};
+    return Object.values(channels)
+        .filter((channel: any) => (channel?.type === DM_TYPE || channel?.type === GROUP_DM_TYPE) && channel?.id)
+        .map((channel: any) => String(channel.id));
+}
+
+function currentPrivateChannelSnapshot() {''',
+    "current archiveable DM IDs",
+)
+
+once(
+    '''    if (!baselineReady || !channelId || !enabledChannels.has(channelId) || !isGroupDm(channelId)) {
+        return { saved: 0, attachmentsQueued: 0 };
+    }''',
+    '''    if (!baselineReady || !channelId || !enabledChannels.has(channelId) || !isArchiveableDm(channelId)) {
+        return { saved: 0, attachmentsQueued: 0 };
+    }''',
+    "live message DM support",
+)
+
+once(
+    '''    if (!pluginRunning || !enabledChannels.has(channelId)
+        || historyGenerations.get(channelId) !== generation || !isGroupDm(channelId)) {''',
+    '''    if (!pluginRunning || !enabledChannels.has(channelId)
+        || historyGenerations.get(channelId) !== generation || !isArchiveableDm(channelId)) {''',
+    "anchor probe DM support",
+)
+
+once(
+    '''function shouldContinueForFullCapture(channelId: string, generation: number) {
+    return pluginRunning && enabledChannels.has(channelId)
+        && historyGenerations.get(channelId) === generation && isGroupDm(channelId);
+}''',
+    '''function shouldContinueForFullCapture(channelId: string, generation: number) {
+    return pluginRunning && enabledChannels.has(channelId)
+        && historyGenerations.get(channelId) === generation && isArchiveableDm(channelId);
+}''',
+    "full capture DM support",
+)
+
+once(
+    '''                if (!pluginRunning || !enabledChannels.has(channelId) || !isGroupDm(channelId)
+                    || olderBackfillGenerations.get(channelId) !== generation) {''',
+    '''                if (!pluginRunning || !enabledChannels.has(channelId) || !isArchiveableDm(channelId)
+                    || olderBackfillGenerations.get(channelId) !== generation) {''',
+    "older backfill DM support",
+)
+
+once(
+    '''            if (!pluginRunning || !enabledChannels.has(channelId) || !isGroupDm(channelId)
+                || historyGenerations.get(channelId) !== generation) {''',
+    '''            if (!pluginRunning || !enabledChannels.has(channelId) || !isArchiveableDm(channelId)
+                || historyGenerations.get(channelId) !== generation) {''',
+    "recent history DM support",
+)
+
+before_filter_count = text.count('const channelIds = [...enabledChannels].filter(isGroupDm);')
+if before_filter_count != 2:
+    raise SystemExit(f"persistent archive filters: expected 2 matches, found {before_filter_count}")
+text = text.replace(
+    'const channelIds = [...enabledChannels].filter(isGroupDm);',
+    'const channelIds = [...enabledChannels].filter(isArchiveableDm);',
+)
+
+once(
+    '''function ghostChannelIds() {
+    const current = new Set(currentGroupIds());''',
+    '''function ghostChannelIds() {
+    const current = new Set(currentArchiveableDmIds());''',
+    "ghost current channel set",
+)
+
+once(
+    '''function onChannelCreate(event: any) {
+    const channel = event?.channel ?? event;
+    const channelId = String(channel?.id ?? "");
+    if (!channelId || channel?.type !== GROUP_DM_TYPE) return;
+
+    if (enabledChannels.has(channelId) && startupCatchupPending.delete(channelId)) {
+        knownGroupIds.add(channelId);
+        runBackground("Late channel-create catch-up failed", archiveRecentHistory(channelId));
+        return;
+    }
+    if (!baselineReady) {''',
+    '''function onChannelCreate(event: any) {
+    const channel = event?.channel ?? event;
+    const channelId = String(channel?.id ?? "");
+    if (!channelId) return;
+
+    if ((channel?.type === DM_TYPE || channel?.type === GROUP_DM_TYPE)
+        && enabledChannels.has(channelId) && startupCatchupPending.delete(channelId)) {
+        if (channel?.type === GROUP_DM_TYPE) knownGroupIds.add(channelId);
+        runBackground("Late channel-create catch-up failed", archiveRecentHistory(channelId));
+        return;
+    }
+    if (channel?.type !== GROUP_DM_TYPE) return;
+    if (!baselineReady) {''',
+    "channel create DM support",
+)
+
+once(
+    '''function onChannelUpdate(event: any) {
+    const channel = event?.channel ?? event;
+    const channelId = String(channel?.id ?? "");
+    if (!channelId || !isGroupDm(channelId) || !enabledChannels.has(channelId)) return;
+    void ensureChannel(channelId, true).catch(error => {
+        console.warn("[LocalGroupArchive] Could not refresh Group DM metadata", error);
+    });
+}''',
+    '''function onChannelUpdate(event: any) {
+    const channel = event?.channel ?? event;
+    const channelId = String(channel?.id ?? "");
+    if (!channelId || !isArchiveableDm(channelId) || !enabledChannels.has(channelId)) return;
+    void ensureChannel(channelId, true).catch(error => {
+        console.warn("[LocalGroupArchive] Could not refresh conversation metadata", error);
+    });
+}''',
+    "channel update DM support",
+)
+
+once(
+    '''                if (!isGroupDm(channelId)) {
+                    sendBotMessage(channelId, { content: "This action only works in **Group DMs**." });
+                    return;
+                }''',
+    '''                if (!isArchiveableDm(channelId)) {
+                    sendBotMessage(channelId, { content: "This action only works in **Direct Messages and Group DMs**." });
+                    return;
+                }''',
+    "command DM guard",
+)
+
+old_choices = '''                    choices: [
+                        commandChoice("INSTANT rescue + keep archiving (recommended)", "start"),
+                        commandChoice("ULTRA FULL history capture (Smart Hybrid one-shot)", "full"),
+                        commandChoice("Snapshot currently loaded messages", "snapshot"),
+                        commandChoice("Wait for attachment downloads", "wait"),
+                        commandChoice("Auto-protect NEW Group DMs: ON", "auto-on"),
+                        commandChoice("Auto-protect NEW Group DMs: OFF", "auto-off"),
+                        commandChoice("Open Discord-style HTML viewer", "viewer"),
+                        commandChoice("Open archive folder", "folder"),
+                        commandChoice("Check archive health + storage", "health"),
+                        commandChoice("Repair viewer + stale temp files", "repair"),
+                        commandChoice("Run interactive setup guide", "guide"),
+                        commandChoice("Reset NEW-group baseline to current groups", "baseline-reset"),
+                        commandChoice("Stop archiving this group", "stop"),
+                        commandChoice("Show status", "status")
+                    ]'''
+new_choices = '''                    choices: [
+                        commandChoice("Start archiving", "start"),
+                        commandChoice("Capture full history", "full"),
+                        commandChoice("Capture loaded messages", "snapshot"),
+                        commandChoice("Wait for downloads", "wait"),
+                        commandChoice("Enable automatic archiving for new Group DMs", "auto-on"),
+                        commandChoice("Disable automatic archiving for new Group DMs", "auto-off"),
+                        commandChoice("Open archive viewer", "viewer"),
+                        commandChoice("Open archive folder", "folder"),
+                        commandChoice("Check archive health", "health"),
+                        commandChoice("Repair archive", "repair"),
+                        commandChoice("Open setup guide", "guide"),
+                        commandChoice("Reset new Group DM baseline", "baseline-reset"),
+                        commandChoice("Stop archiving", "stop"),
+                        commandChoice("Show status", "status")
+                    ]'''
+once(old_choices, new_choices, "command labels")
+
+once(
+    'description: "Fast local Group DM archiver with automatic new-group capture, attachments, and a Discord-style HTML viewer.",',
+    'description: "Local archive for Discord Direct Messages and Group DMs, including history, attachments, and an HTML viewer.",',
+    "plugin description",
+)
+
+text = text.replace("archived group(s)", "archived conversation(s)")
+text = text.replace("group index(es)", "conversation index(es)")
+text = text.replace("Archive **OFF** for this group.", "Archive **OFF** for this conversation.")
+text = text.replace("This group's history:", "This conversation's history:")
+text = text.replace("NEW-group shield:", "Automatic new Group DM archiving:")
+text = text.replace("**NEW-group shield is ON.**", "**Automatic new Group DM archiving is ON.**")
+text = text.replace("**NEW-group shield is OFF.**", "**Automatic new Group DM archiving is OFF.**")
+
+start_block = re.compile(
+    r'''\s+sendBotMessage\(channelId, \{\n\s+content: historyReady\n\s+\? "⚡ \*\*Instant rescue started\.\*\*[\s\S]*?\n\s+\}\);'''
+)
+replacement = '''
+                sendBotMessage(channelId, {
+                    content: historyReady
+                        ? "Archive update started. The saved history is complete, so only new messages and the currently loaded cache will be checked."
+                        : resumableHybrid
+                            ? "History capture resumed. Completed ranges will not be downloaded again."
+                            : hasLocalArchive
+                                ? "Archive update started. New messages and any missing older history will be captured."
+                                : "Full history capture started. Text history is captured before queued media downloads."
+                });'''
+text, n = start_block.subn(replacement, text, count=1)
+if n != 1:
+    raise SystemExit(f"start status text: expected 1 block, found {n}")
+
+old_final = '''                    sendBotMessage(channelId, {
+                        content: `${historyReady ? "⚡ Delta rescue" : resumableHybrid ? "⚡ Smart Hybrid resume" : hasLocalArchive ? "⚡ Partial-archive rescue" : "🚀 Cold Smart Hybrid rescue"}: snapshotted **${snapshot.saved}** loaded message(s). ${historySummary(result)} History baseline: **${nowReady ? "READY ⚡" : "still capturing"}**. New messages keep archiving automatically.`
+                    });'''
+new_final = '''                    sendBotMessage(channelId, {
+                        content: `Archive updated. Captured **${snapshot.saved}** loaded message(s). ${historySummary(result)} History state: **${nowReady ? "complete" : "incomplete"}**. New messages will continue to be archived.`
+                    });'''
+once(old_final, new_final, "start completion text")
+
+text = text.replace(
+    'console.error("[LocalGroupArchive] Rescue failed", error);',
+    'console.error("[LocalGroupArchive] Archive update failed", error);',
+)
+text = text.replace(
+    "Archive is still **ON**, but rescue hit an error:",
+    "Archive is still **ON**, but the update failed:",
+)
+
+full_start = re.compile(
+    r'''sendBotMessage\(channelId, \{ content: `🚨 \*\*ULTRA FULL one-shot capture started \(v\$\{PLUGIN_VERSION\} Panic Burst\)\.\*\*[\s\S]*?Progress appears about every 5 seconds\.` \}\);'''
+)
+text, n = full_start.subn(
+    'sendBotMessage(channelId, { content: `Full history capture started (v${PLUGIN_VERSION}). This is a one-time capture and does not enable background archiving unless it was already enabled. Existing completed ranges are reused, missing ranges are verified, and media downloads begin after the critical text-history phase. Progress is reported periodically.` });',
+    text,
+    count=1,
+)
+if n != 1:
+    raise SystemExit(f"full start text: expected 1 block, found {n}")
+
+summary_pattern = re.compile(
+    r'''function historySummary\(result: HistoryResult\) \{[\s\S]*?\n\}\n\nfunction formatBytes'''
+)
+clean_summary = '''function historySummary(result: HistoryResult) {
+    const fetchShape = result.strategy === "hybrid"
+        ? `Fetched **${result.messages}** unique message object(s) and wrote **${result.saved}** message object(s) using ${result.pages} history + ${result.searchRequests ?? 0} channel-search + ${result.globalSearchRequests ?? 0} global-DM-search request(s).`
+        : result.strategy === "search-sweep"
+            ? `Fetched **${result.messages}**${result.expectedMessages ? ` / ${result.expectedMessages}` : ""} and wrote **${result.saved}** message(s) using ${result.pages} history request(s) and ${result.searchRequests ?? 0} search request(s).`
+            : `Fetched **${result.messages}** and wrote **${result.saved}** message(s) across ${result.pages} history request(s).`;
+    const parts = [fetchShape, `${result.attachmentsQueued} new media download(s) queued.`];
+    if (result.writeFailures) parts.push(`${result.writeFailures} disk batch(es) failed.`);
+    if (result.reachedLimit) parts.push("The 5,000-request safety limit was reached; older messages may remain.");
+    if (result.partialError) parts.push(`Partial error: ${result.partialError}`);
+    if (result.cancelled) parts.push("Capture was interrupted; data already written to disk was kept.");
+    if (result.strategy === "hybrid" && typeof result.panicMessages === "number") {
+        parts.push(`Captured **${result.panicMessages}** unique message object(s) during the first ${(PANIC_BURST_MS / 1000).toFixed(0)} seconds.`);
+    }
+    if (result.resumedSegments) parts.push(`Reused **${result.resumedSegments}** completed range(s) without downloading them again.`);
+    if (result.repairedSegments) parts.push(`Verified **${result.repairedSegments}** incomplete range(s) with direct history requests.`);
+    if (typeof result.elapsedMs === "number") {
+        const strategy = result.strategy === "hybrid"
+            ? `hybrid capture, ${result.anchors ?? 0} anchor(s), peak ${result.peakLanes ?? 1} concurrent request lane(s)`
+            : result.strategy === "search-sweep"
+                ? `search capture, peak ${result.peakLanes ?? SEARCH_SWEEP_CONCURRENCY} request worker(s)`
+                : result.strategy === "anchored"
+                    ? `anchored history capture, ${result.anchors ?? 0} anchor(s), peak ${result.peakLanes ?? 1} lane(s)`
+                    : "cursor history capture";
+        const anchorInfo = result.anchorQueries ? `, ${result.anchorQueries} anchor lookup request(s)` : "";
+        const avg = result.averageRequestMs ? `, average request wait ${(result.averageRequestMs / 1000).toFixed(2)}s` : "";
+        parts.push(`Capture time: **${(result.elapsedMs / 1000).toFixed(2)}s** (${strategy}${anchorInfo}${avg}).`);
+    }
+    return parts.join(" ");
+}
+
+function formatBytes'''
+text, n = summary_pattern.subn(clean_summary, text, count=1)
+if n != 1:
+    raise SystemExit(f"history summary: expected 1 block, found {n}")
+
+text = text.replace('content: `🚀 **Search Sweep:**', 'content: `**History capture progress:**')
+text = re.sub(
+    r'content: `⚡ \*\*Smart Hybrid\$\{panicRemaining \? " PANIC" : ""\}:\*\*',
+    'content: `**History capture progress:**',
+    text,
+)
+text = text.replace('`⏱️ **Full capture progress:**', '`**History capture progress:**')
+
+index_path.write_text(text, encoding="utf-8")
+
+package_path = Path("package.json")
+package = json.loads(package_path.read_text(encoding="utf-8"))
+package["version"] = "0.9.4"
+package["description"] = "A resilient local archive for Discord Direct Messages and Group DMs."
+package_path.write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
+
+readme = r'''# LocalGroupArchive v0.9.4
+
+LocalGroupArchive is a Vencord userplugin that stores Discord Direct Messages and Group DMs locally on your computer. It can capture message history, attachments, voice messages, embeds, stickers, reactions, and conversation metadata, then display the saved data in a local Discord-style HTML viewer.
+
+The plugin only archives data that your Discord account can currently access. It does not bypass Discord permissions and it cannot recover messages that Discord no longer provides to your account. Vencord is a third-party project and is not affiliated with Discord.
+
+## Supported conversations
+
+Manual archive commands work in both:
+
+- Direct Messages
+- Group DMs
+
+Automatic archiving remains limited to newly created or newly joined Group DMs. Direct Messages are never enabled automatically.
+
+## Storage
+
+Archives are stored under:
+
+`Documents\DiscordLocalArchive`
+
+Messages are written to durable local capture files and compacted into viewer data. Re-running a full capture does not create duplicate message records because messages are keyed by Discord message ID and completed history ranges can be reused.
+
+## History capture
+
+A full history capture uses several Discord client routes when available:
+
+- `GET /channels/:id/messages` for normal history pages
+- channel-scoped message search
+- global DM search restricted to the current conversation
+
+The first few seconds use higher request concurrency to save text history quickly. Request handling still goes through Vencord's `RestAPI`, so Discord rate limits remain in effect. After the text-history phase, queued media downloads continue separately.
+
+If a capture is interrupted, completed ranges are recorded in `capture/coverage.json`. Running full history capture again resumes the missing ranges instead of downloading proven ranges again.
+
+## Automatic Group DM archiving
+
+Automatic archiving is designed only for new Group DMs. A saved cutoff prevents an old Group DM from being mistaken for a new one when Discord loads it into `ChannelStore` later.
+
+When automatic archiving is enabled, a newly created Group DM or a Group DM you are newly added to can begin archiving automatically. Existing Group DMs remain unchanged unless you start archiving them manually.
+
+Direct Messages are never automatically enabled.
+
+## Slash command
+
+Use `/localarchive` inside a Direct Message or Group DM.
+
+| Action | Description |
+| --- | --- |
+| `start` | Enable persistent archiving for the current conversation and capture missing history |
+| `full` | Capture the full available history once without enabling persistent archiving if it was previously off |
+| `snapshot` | Save messages currently loaded in Discord's message store |
+| `wait` | Wait for queued media downloads to finish |
+| `auto-on` | Enable automatic archiving for new Group DMs |
+| `auto-off` | Disable automatic archiving for new Group DMs |
+| `viewer` | Open the local archive viewer |
+| `folder` | Open the archive folder |
+| `health` | Check archive integrity and storage usage |
+| `repair` | Rebuild viewer indexes and remove stale temporary files |
+| `guide` | Open the setup guide |
+| `baseline-reset` | Treat currently existing Group DMs as the automatic-archive baseline |
+| `stop` | Disable persistent archiving for the current conversation |
+| `status` | Show archive status and download queue information |
+
+Actions that manage the archive folder, viewer, health, repair, setup guide, or automatic Group DM setting can be selected from any channel where Vencord exposes the command. Conversation-specific capture actions require a Direct Message or Group DM.
+
+## One-time full capture
+
+`full` is the simplest option when you only want a local copy of a conversation.
+
+If persistent archiving is off before the command starts, the plugin temporarily enables writes for the conversation, captures the available history and media, waits for queued media to finish, then returns the conversation to the previous disabled state. Running `full` again later reuses existing data and does not intentionally duplicate saved messages.
+
+## Persistent archiving
+
+`start` keeps the current Direct Message or Group DM enabled after the initial capture. New messages, edits, deletions, and reaction changes are written to the local archive while Vencord is running. Completed archives are periodically checked for small missed deltas.
+
+Use `stop` to disable persistent archiving without deleting existing local files.
+
+## Viewer
+
+The local viewer runs on `127.0.0.1` and reads the saved archive from disk. Archived Group DMs that are no longer available in Discord can appear as local read-only entries in the DM list when they were persistently protected before access was lost.
+
+## Installation on Windows
+
+1. Download the latest `LocalGroupArchive-Setup-vX.Y.Z.exe` and its `.sha256` file from GitHub Releases.
+2. Run the installer. Administrator access is not required.
+3. The release workflow builds a Developer Vencord runtime from the pinned Vencord commit used by this project.
+4. The installer verifies the packaged runtime and installs the userplugin.
+5. Restart Discord if the installer does not restart it automatically, then enable LocalGroupArchive in Vencord settings.
+
+The installer is not signed with a commercial Windows code-signing certificate, so Windows SmartScreen may appear on first launch. Verify the published SHA-256 hash before running the installer.
+
+Uninstalling the plugin restores the original Discord `app.asar` and leaves `Documents\DiscordLocalArchive` untouched.
+
+## Safety and limitations
+
+- The plugin uses the permissions of the signed-in Discord account.
+- It does not use a raw user token to bypass REST rate limits.
+- Discord can change private APIs at any time, which may require plugin updates.
+- Search results for older history may not include every field that normal message-history responses include. The plugin verifies history ranges and falls back to direct history requests when needed.
+- Deleted or inaccessible content cannot be recovered if Discord no longer provides it.
+
+## Development
+
+The repository contains the Vencord userplugin, native archive helpers, viewer code, installer, smoke tests, and GitHub Actions workflows used to build releases.
+
+Run the repository smoke tests with:
+
+```bash
+npm test
+```
+
+Release builds additionally compile the plugin against the pinned Vencord version and run TypeScript and ESLint checks before publishing the installer.
+
+## License
+
+GPL-3.0-or-later
+'''
+Path("README.md").write_text(readme, encoding="utf-8")
+Path("plugin/LocalGroupArchive/README.md").write_text(readme, encoding="utf-8")
+
+changelog_path = Path("CHANGELOG.md")
+changelog = changelog_path.read_text(encoding="utf-8")
+entry = '''# Changelog
+
+## 0.9.4
+
+- Added manual archiving support for Direct Messages in addition to Group DMs.
+- Kept automatic archiving limited to new Group DMs.
+- Replaced promotional command labels and status text with short, consistent terminology.
+- Rewrote the project README in English and documented Direct Message support.
+
+'''
+if changelog.startswith("# Changelog"):
+    changelog = entry + changelog[len("# Changelog"):].lstrip("\n")
+else:
+    changelog = entry + changelog
+changelog_path.write_text(changelog, encoding="utf-8")
