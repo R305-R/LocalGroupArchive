@@ -23,6 +23,36 @@ jobs:
         with:
           node-version: 22
 
+      - name: Adjust patch helper
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/scripts/apply_direct_dm_clean_ui.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''before_filter_count = text.count('const channelIds = [...enabledChannels].filter(isGroupDm);')
+          if before_filter_count != 2:
+              raise SystemExit(f"persistent archive filters: expected 2 matches, found {before_filter_count}")
+          text = text.replace(
+              'const channelIds = [...enabledChannels].filter(isGroupDm);',
+              'const channelIds = [...enabledChannels].filter(isArchiveableDm);',
+          )'''
+          new = '''before_filter_count = text.count('const channelIds = [...enabledChannels].filter(isGroupDm);')
+          if before_filter_count != 1:
+              raise SystemExit(f"startup archive filter: expected 1 match, found {before_filter_count}")
+          text = text.replace(
+              'const channelIds = [...enabledChannels].filter(isGroupDm);',
+              'const channelIds = [...enabledChannels].filter(isArchiveableDm);',
+          )
+          once(
+              'const channelIds = [...enabledChannels].filter(isGroupDm).sort(snowflakeCompare);',
+              'const channelIds = [...enabledChannels].filter(isArchiveableDm).sort(snowflakeCompare);',
+              "reconcile archive filter",
+          )'''
+          if old not in s:
+              raise SystemExit('patch helper filter block not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
+
       - name: Apply changes
         run: python3 .github/scripts/apply_direct_dm_clean_ui.py
 
