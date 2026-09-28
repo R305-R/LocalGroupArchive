@@ -64,15 +64,24 @@ jobs:
           s = s[:start] + replacement + s[end:]
 
           marker = 'index_path.write_text(text, encoding="utf-8")'
-          viewer_patch = '''index_path.write_text(text, encoding="utf-8")
+          extra = '''index_path.write_text(text, encoding="utf-8")
 
           viewer_path = Path("plugin/LocalGroupArchive/viewer.ts")
-          viewer = viewer_path.read_text(encoding="utf-8")
-          viewer = viewer.replace("LOCAL • v0.9.3", "LOCAL • v0.9.4")
-          viewer_path.write_text(viewer, encoding="utf-8")'''
+          viewer = viewer_path.read_text(encoding="utf-8").replace("LOCAL • v0.9.3", "LOCAL • v0.9.4")
+          viewer_path.write_text(viewer, encoding="utf-8")
+
+          for version_path in [
+              Path("installer/Install-LocalGroupArchive.ps1"),
+              Path("installer/Update-LocalGroupArchive.ps1"),
+              Path("installer/LocalGroupArchive.iss"),
+          ]:
+              version_text = version_path.read_text(encoding="utf-8")
+              if "0.9.3" not in version_text:
+                  raise SystemExit(f"expected 0.9.3 in {version_path}")
+              version_path.write_text(version_text.replace("0.9.3", "0.9.4"), encoding="utf-8")'''
           if marker not in s:
-              raise SystemExit('viewer insertion marker not found')
-          s = s.replace(marker, viewer_patch, 1)
+              raise SystemExit('version insertion marker not found')
+          s = s.replace(marker, extra, 1)
           p.write_text(s, encoding='utf-8')
           PY
 
@@ -119,6 +128,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add plugin/LocalGroupArchive/index.ts plugin/LocalGroupArchive/viewer.ts plugin/LocalGroupArchive/README.md README.md CHANGELOG.md package.json tests/smoke.mjs
+          git add plugin/LocalGroupArchive/index.ts plugin/LocalGroupArchive/viewer.ts plugin/LocalGroupArchive/README.md README.md CHANGELOG.md package.json tests/smoke.mjs installer/Install-LocalGroupArchive.ps1 installer/Update-LocalGroupArchive.ps1 installer/LocalGroupArchive.iss
           git commit -m "Add Direct Message archiving and standardize UI"
           git push origin HEAD:feature/direct-dm-clean-ui
