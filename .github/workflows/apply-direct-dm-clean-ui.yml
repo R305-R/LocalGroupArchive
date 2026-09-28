@@ -62,11 +62,53 @@ jobs:
               "start completion text",
           )'''
           s = s[:start] + replacement + s[end:]
+
+          marker = 'index_path.write_text(text, encoding="utf-8")'
+          viewer_patch = '''index_path.write_text(text, encoding="utf-8")
+
+          viewer_path = Path("plugin/LocalGroupArchive/viewer.ts")
+          viewer = viewer_path.read_text(encoding="utf-8")
+          viewer = viewer.replace("LOCAL • v0.9.3", "LOCAL • v0.9.4")
+          viewer_path.write_text(viewer, encoding="utf-8")'''
+          if marker not in s:
+              raise SystemExit('viewer insertion marker not found')
+          s = s.replace(marker, viewer_patch, 1)
           p.write_text(s, encoding='utf-8')
           PY
 
       - name: Apply changes
         run: python3 .github/scripts/apply_direct_dm_clean_ui.py
+
+      - name: Update smoke expectations
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/smoke.mjs')
+          s = p.read_text(encoding='utf-8')
+          replacements = {
+              'assert.match(html, /LOCAL • v0\\.9\\.3/);': 'assert.match(html, /LOCAL • v0\\.9\\.4/);',
+              'assert.match(mainPlugin, /Auto-protect NEW Group DMs/);': 'assert.match(mainPlugin, /Enable automatic archiving for new Group DMs/);',
+              'assert.match(mainPlugin, /NEW-group shield: \\*\\*\\$\\{autoNewGroups \\? "ON" : "OFF"\\}\\*\\*/);': 'assert.match(mainPlugin, /Automatic new Group DM archiving: \\*\\*\\$\\{autoNewGroups \\? "ON" : "OFF"\\}\\*\\*/);',
+              'assert.match(mainPlugin, /ULTRA FULL one-shot capture started \\(v\\$\\{PLUGIN_VERSION\\} Panic Burst\\)/);': 'assert.match(mainPlugin, /Full history capture started \\(v\\$\\{PLUGIN_VERSION\\}\\)/);',
+              'assert.match(mainPlugin, /Full capture progress/);': 'assert.match(mainPlugin, /History capture progress/);',
+              'assert.match(mainPlugin, /INSTANT rescue/);': 'assert.match(mainPlugin, /Archive update started/);',
+          }
+          for old, new in replacements.items():
+              if old not in s:
+                  raise SystemExit(f'missing smoke expectation: {old}')
+              s = s.replace(old, new, 1)
+
+          anchor = 'assert.match(mainPlugin, /archiveRecentHistory/);\n'
+          addition = '''assert.match(mainPlugin, /archiveRecentHistory/);
+          assert.match(mainPlugin, /const DM_TYPE = 1/);
+          assert.match(mainPlugin, /function isArchiveableDm/);
+          assert.match(mainPlugin, /Direct Messages and Group DMs/);
+          '''
+          if anchor not in s:
+              raise SystemExit('smoke insertion anchor not found')
+          s = s.replace(anchor, addition, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
 
       - name: Validate changes
         run: |
@@ -77,6 +119,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add plugin/LocalGroupArchive/index.ts plugin/LocalGroupArchive/README.md README.md CHANGELOG.md package.json
+          git add plugin/LocalGroupArchive/index.ts plugin/LocalGroupArchive/viewer.ts plugin/LocalGroupArchive/README.md README.md CHANGELOG.md package.json tests/smoke.mjs
           git commit -m "Add Direct Message archiving and standardize UI"
           git push origin HEAD:feature/direct-dm-clean-ui
