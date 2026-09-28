@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Repository,
-    [string]$CurrentVersion = "0.9.3"
+    [string]$CurrentVersion = "0.9.4"
 )
 
 $ErrorActionPreference = "Stop"

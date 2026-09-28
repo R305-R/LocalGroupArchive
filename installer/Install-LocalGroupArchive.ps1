@@ -17,7 +17,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$ProductVersion = "0.9.3"
+$ProductVersion = "0.9.4"
 $PinnedVencordCommit = "0850f37fbb1623aa6330764d8f4b1e0b2617dcdf"
 $InstallRoot = Join-Path $env:LOCALAPPDATA "LocalGroupArchive"
 $VencordRoot = Join-Path $InstallRoot "Vencord"

@@ -1,146 +1,117 @@
-# LocalGroupArchive v0.9.3
+# LocalGroupArchive v0.9.4
 
-إضافة Vencord تحفظ **Group DMs التي تصبح جديدة عندك بعد تفعيل الحماية** محليًا على جهازك، وتعطي النصوص والرسائل الصوتية أولوية إنقاذ قصوى، وتبقي القروب المحفوظ ظاهرًا كـGhost Archive بعد فقدان العضوية.
+LocalGroupArchive is a Vencord userplugin that stores Discord Direct Messages and Group DMs locally on your computer. It can capture message history, attachments, voice messages, embeds, stickers, reactions, and conversation metadata, then display the saved data in a local Discord-style HTML viewer.
 
-> LocalGroupArchive لا يتجاوز صلاحيات حسابك ولا يسترجع شيئًا لم يعد Discord يرسله للحساب. Vencord مشروع طرف ثالث وغير تابع لديسكورد.
+The plugin only archives data that your Discord account can currently access. It does not bypass Discord permissions and it cannot recover messages that Discord no longer provides to your account. Vencord is a third-party project and is not affiliated with Discord.
 
-## القروبات الجديدة فقط
+## Supported conversations
 
-v0.9.3 يحفظ **وقت cutoff** حتى لا يعتبر قروبًا قديمًا مجردَ قروب جديد لأن Discord حمّله متأخرًا في `ChannelStore`. وفوق ذلك يستمع لأحداث `CHANNEL_CREATE` و`CHANNEL_RECIPIENT_ADD`: إذا أصبحت عضوًا في Group DM بعد جاهزية الإضافة، يعامله كـ**جديد عندك** ويبدأ حمايته فورًا حتى لو كان القروب نفسه أقدم من وقت تثبيت الإضافة. القروبات القديمة التي لا يحدث فيها دخول جديد تبقى متجاهلة. وتقدر دائمًا تفعّل أي قروب قديم يدويًا بأمر `/localarchive`.
+Manual archive commands work in both:
 
-هذا التصميم متعمد: لا يوجد Hot Mirror لكل حسابك، ولا عملية تمشي على كل قروباتك القديمة بدون طلب منك.
+- Direct Messages
+- Group DMs
 
-حماية القروبات الجديدة تكون **ON افتراضيًا في التثبيت الجديد**، وتبقى آخر قيمة اخترتها محفوظة بعد إعادة التشغيل. للتثبيت المؤكد اختر `Auto-protect NEW Group DMs: ON` مرة واحدة، ثم استخدم `Show status` وتأكد أن السطر يعرض `NEW-group shield: ON`. عبارة `Persistent archive state` في نتيجة أمر one-shot تخص القروب الحالي وحده ولا تمثل هذا الدرع العام.
+Automatic archiving remains limited to newly created or newly joined Group DMs. Direct Messages are never enabled automatically.
 
-## Panic Burst + Smart Hybrid + Warm Mirror في v0.9.3
+## Storage
 
-القياس الواقعي على v0.9.0 التقط 4,870 رسالة في أول 5 ثوانٍ و9,121 من 12,870 خلال 10.1 ثانية، ثم تباطأ بعد استهلاك burst الأولي. لذلك v0.9.3 يحتفظ بمرحلة إنقاذ أمامية مدتها خمس ثوانٍ، ثم ينتقل إلى وضع متزن لإثبات الاكتمال:
-
-- **Warm Mirror:** رسائل القروب المحمي وتعديلاته وحذفه وردود الفعل تُحفظ فور وصول أحداث Gateway. وفوق ذلك يراجع قروبًا محميًا مكتملًا كل 45 ثانية بالتناوب، وعند إعادة اتصال Discord يراجع كل المرايا المكتملة اثنتين معًا. بهذا تصبح الفجوات delta صغيرة، والتشغيل اللاحق غالبًا يحتاج صفر أو طلبًا واحدًا بدل إعادة 12 ألف رسالة.
-- **Smart Hybrid للبدء البارد:** يثبت أحدث 100 رسالة بطلب `/messages` واحد، ثم يكتشف حدودًا حقيقية من IDs موجودة فعلاً ويقسّم التاريخ إلى نطاقات غير متداخلة.
-- النطاقات تعمل بالتوازي فوق ثلاث طائرات: `GET /channels/:id/messages`، وبحث القروب `POST /channels/:id/messages/search/tabs`، وبحث الرسائل الخاصة العام `POST /users/@me/messages/search/tabs` مع تقييده لنفس القروب. الهدف توزيع العمل على routes مختلفة بدل تكديس 100+ طلب في طابور واحد.
-- **Panic Burst لأول 5 ثوانٍ:** يبدأ المسار العادي بستة workers فورًا، ويعمل workerان لكل search route خلال النافذة الأولى. تبقى إدارة 429 لـVencord `RestAPI`؛ لا يوجد raw-token fetch أو تجاوز للحدود.
-- لا يخفض المتحكم التزامن أثناء Panic Burst. وبعدها ينقص درجة واحدة فقط كل ثانيتين وبحد أدنى workerين، بدل أن تعاقب عدة استجابات من موجة البطء نفسها التزامن من 6 إلى 1.
-- عندما تنتهي النطاقات المخصصة للمسار العادي ويبقى Search بطيئًا، تسرق workers العادية النطاقات غير الموجودة داخل طلب Search جارٍ وتمشيها authoritative عبر `/messages`. إزالة التكرار تبقى بالـmessage ID.
-- كل نطاق بحث يجب أن يطابق `track_exact_total_hits`، والنطاق المأخوذ من البحث العام يُعاد إثبات عدده عبر بحث القروب. إذا فشل نطاق واحد فقط، يصلحه `/messages` بشكل authoritative؛ لا تعاد أرشفة التاريخ كله بسبب 16 رسالة ناقصة.
-- كل دفعة تُكتب إلى **NDJSON capture pack** أولًا. أثناء Panic Burst تؤجل checkpoints الإدارية وتُجمع، ثم لا يُسجل النطاق كمكتمل في `capture/coverage.json` إلا بعد نجاح كتابة الدفعات فعليًا. إذا توقف Discord أو انطفأ الجهاز، التشغيل التالي يتجاوز النطاقات المثبتة ويستأنف الناقص فقط.
-- أثناء المرحلة النصية الحرجة تتوقف **كل** تنزيلات CDN، بما فيها Voice Messages، حتى لا تزاحم REST. بعد توقف التاريخ تُصف الوسائط دفعة واحدة، وتبقى الصوتيات صاحبة الأولوية داخل مرحلة التنزيل.
-- Search قد يعيد الرسالة بدون `reactions`. أحدث 100 رسالة تأتي من `/messages` بكامل شكلها؛ النص والمرفقات والردود والإيمبدات في النتائج الأقدم تبقى محفوظة، لكن reactions القديمة ليست ضمن ضمان المسار السريع.
-
-النتيجة المستهدفة: تعظيم ما ينجو محليًا قبل طرد سريع، ثم إثبات الباقي إذا استمر الوصول. لا يمكن ضمان 12 ألف رسالة خلال خمس ثوانٍ لأن Discord يحدد السرعة والـbuckets، لكن v0.9.3 لا يضيّع burst الأولي في التدرج أو checkpoints أو انتظار route واحد. الضمان الأسرع يظل إبقاء القروب **دافئًا قبل الحاجة**.
-
-## Ghost Groups بعد الطرد أو المغادرة
-
-إذا كان القروب محميًا ثم اختفى من Discord، لا يُحذف أرشيفه. يظهر كصف محلي باسم القروب في قائمة الرسائل الخاصة مع:
-
-`ARCHIVED • no longer a member`
-
-الضغط عليه يفتح النسخة المحلية read-only المركزة على ذلك القروب، ويظهر تنبيه أن الحساب لم يعد عضوًا. لا يتم حقن Channel مزيف في `ChannelStore`، لذلك Ghost Group لا يجعل Discord يحاول طلب قناة لم تعد لديك صلاحية لها.
-
-الدمج مع قائمة الـDM مبني على نفس seam الذي يستخدمه PinDMs في Vencord، مع wrapping للتعبير بدل افتراض identifier خام، حتى يمكن للإضافتين العمل معًا على نسخة Vencord المثبتة.
-
-## التثبيت السهل على Windows
-
-1. نزّل `LocalGroupArchive-Setup-v0.9.3.exe` وملف `.sha256` من GitHub Release.
-2. افتح المثبت. لا يحتاج Administrator.
-3. GitHub يبني Developer Vencord مسبقًا على Windows من commit مثبت ومختبر مع هذه النسخة:
-   `0850f37fbb1623aa6330764d8f4b1e0b2617dcdf`
-4. الـEXE يحتوي حزمة Vencord المبنية، يتحقق من SHA-256، وينشئ loader صغيرًا ثم يحقنها مباشرة. جهاز المستخدم لا يحتاج Node.js ولا pnpm ولا تنزيل 561 حزمة.
-5. المثبت يغلق Discord ثم يعيد فتحه تلقائيًا. بعد الفتح اتبع دليل الإضاءة داخل التطبيق لتفعيل LocalGroupArchive.
-
-v0.9.3 يلغي مرحلة `node_modules` التي كانت تفشل بخطأ `UNKNOWN/-4094` على بعض أجهزة Windows. البناء كله يحدث في GitHub، ثم يصل إلى الجهاز كملفات JavaScript/CSS جاهزة. إذا استمر أي فشل آخر، تعرض نافذة المثبت السبب الحقيقي ومسار السجل وآخر سطوره مباشرة.
-
-ملف التثبيت غير موقّع بشهادة تجارية، لذلك قد يظهر Windows SmartScreen لأول تشغيل. تحقّق من SHA-256 المنشور مع الإصدار.
-
-عند الإزالة، يعيد المثبت ملف Discord الأصلي `app.asar` ويترك `Documents\DiscordLocalArchive` كما هو. Userplugins الأخرى الموجودة داخل بيئة قديمة مُدارة تُنسخ إلى مجلد احتياطي قبل التنظيف.
-
-## الاستخدام
-
-اكتب `/localarchive` داخل Group DM. أهم الأوامر:
-
-| الإجراء | الوظيفة |
-|---|---|
-| `INSTANT rescue + keep archiving` | يفعّل القروب يدويًا، يحفظ MessageStore فورًا، ثم يختار delta أو استكمال دفتر Smart Hybrid أو بدءًا باردًا |
-| `ULTRA FULL history capture (Smart Hybrid one-shot)` | يبدأ Panic Burst لخمس ثوانٍ ثم يثبت التاريخ كاملًا مرة واحدة من دون تحويل قروب قديم تلقائيًا إلى أرشيف خلفي دائم |
-| `Snapshot currently loaded messages` | يحفظ فقط الرسائل الموجودة حاليًا في MessageStore ويصفّ الوسائط والأصول المرتبطة بها |
-| `Auto-protect NEW Group DMs: ON/OFF` | يتحكم بحماية القروبات التي تظهر بعد الـbaseline فقط |
-| `Reset NEW-group baseline to current groups` | يجعل القروبات الظاهرة الآن قديمة/متجاهلة تلقائيًا بدون حذف ملفاتها المحلية |
-| `Wait for attachment downloads` | ينتظر انتهاء تنزيلات الوسائط الحالية |
-| `Open Discord-style HTML viewer` | يفتح العارض المحلي الحي من `127.0.0.1` |
-| `Open archive folder` | يفتح مجلد البيانات |
-| `Check archive health + storage` | يفحص البنية والحجم والملفات المؤقتة |
-| `Repair viewer + stale temp files` | يعيد بناء الفهارس وينظف الملفات المؤقتة القديمة |
-| `Stop archiving this group` | يوقف حماية القروب مع إبقاء الأرشيف الموجود |
-| `Show status` | يعرض حالة الحماية، baseline، اكتمال التاريخ، وطابور الميديا |
-
-## ترتيب الأولوية وقت الإنقاذ
-
-الترتيب المقصود هو:
-
-1. **Text history أولًا وحده**: النصوص وروابط الوسائط تدخل capture packs فورًا، وتُجمّد كل تنزيلات CDN كي لا تزاحم routes التاريخ.
-2. بعد توقف/اكتمال مسار التاريخ، تُطلق Voice Messages أولًا ثم الصور والفيديو والملفات وبقية الأصول.
-3. الفهرسة الثقيلة للعارض وتحويل capture packs إلى ملفات الرسائل النهائية تعمل خارج المسار الحرج قدر الإمكان.
-
-وجود رابط CDN محفوظ لا يضمن بقاءه صالحًا للأبد، لكنه يسمح بمحاولة التنزيل بعد فقدان القروب بدون إعادة طلب الرسالة نفسها.
-
-## العارض المحلي
-
-الـViewer يعمل من خادم مؤقت مربوط بـ`127.0.0.1` فقط أثناء تشغيل Discord، بدل الاعتماد على `file://`. يقرأ الأرشيف الحقيقي لحظة الفتح، ويخدم الصور والفيديو والصوتيات محليًا مع byte-range للصوت والفيديو. كما يكتشف Documents العادي ومسارات OneDrive Documents الشائعة ويختار المسار الذي يحتوي الأرشيف.
-
-الواجهة ترسم نافذة DOM منزلقة من 300 رسالة بدل رمي آلاف العناصر في الصفحة دفعة واحدة: عند الصعود تحمل الدفعة الأقدم وتزيل جزءًا بعيدًا من الطرف الآخر، وعند الرجوع تعكس العملية مع حفظ موضع التمرير، مثل virtualized list في Discord. الأرشيف نفسه لا يقتصر على 300. ويتوفر بحث موحد وتصدير JSON للقروب المحدد.
-
-## مكان البيانات والخصوصية
-
-المجلد الرئيسي:
+Archives are stored under:
 
 `Documents\DiscordLocalArchive`
 
-ويحتوي عادةً على:
+Messages are written to durable local capture files and compacted into viewer data. Re-running a full capture does not create duplicate message records because messages are keyed by Discord message ID and completed history ranges can be reused.
 
-- `CHANNEL_ID\messages`: النسخة النهائية المعروفة لكل رسالة بعد compaction.
-- `CHANNEL_ID\capture`: capture packs المؤقتة/القابلة للاستعادة أثناء السحب.
-- `CHANNEL_ID\capture\coverage.json`: دفتر النطاقات المكتملة لاستئناف Smart Hybrid بعد الانقطاع.
-- `CHANNEL_ID\revisions`: نسخ الرسائل السابقة عند التعديل.
-- `CHANNEL_ID\attachments`: المرفقات المحملة.
-- `_assets`: الأفاتارات وصور القروبات والإيمبدات والملصقات والإيموجي المحلية.
-- ملفات viewer والفهارس المحلية.
+## History capture
 
-البيانات غير مشفرة داخل الأرشيف. أي مستخدم أو برنامج يملك صلاحية قراءة حساب Windows يستطيع قراءتها، لذلك استخدم تشفير القرص إذا كان المحتوى حساسًا. لا ترسل الإضافة الأرشيف إلى خادم خاص بالمشروع.
+A full history capture uses several Discord client routes when available:
 
-## حدود مهمة
+- `GET /channels/:id/messages` for normal history pages
+- channel-scoped message search
+- global DM search restricted to the current conversation
 
-- رسالة حُذفت قبل أن تصل إلى العميل أو قبل أن يقرأها المسح لا يمكن استرجاعها من العدم.
-- بعد فقدان الوصول، لا تبدأ الإضافة طلبات Discord جديدة للقروب. ما سبق التقاطه محليًا يظل محفوظًا، وروابط CDN المحفوظة يمكن محاولة تنزيلها ما دامت صالحة.
-- المكالمات الصوتية الحية لا تُسجّل. Voice Messages والمرفقات الصوتية/الفيديو/الصور مدعومة.
-- حجم المرفق الواحد محدود وقائيًا إلى 512 MiB.
-- Repair عبر `/messages` لديه **سقف عالمي 5,000 طلب لكل تشغيل** لمنع حلقة غير محدودة. هذا سقف أمان، وليس وعدًا بعدد رسائل محدد.
-- Smart Hybrid لا يتجاوز rate limits؛ `RestAPI` يظل المسؤول عن انتظار buckets. لا يستطيع أي تصميم محلي ضمان أقل من 10 ثوانٍ لأول سحب بارد ضخم إذا Discord قيّد routes الثلاثة.
-- نتائج `search/tabs` لا تتضمن `reactions` للرسائل القديمة. أحدث 100 رسالة تُلتقط من `/messages` بكاملها، أما reactions الأقدم فليست جزءًا من مسار الإنقاذ السريع.
-- Ghost Group يعرض ما تم حفظه محليًا فقط، ولا يعيد صلاحية القروب.
+The first few seconds use higher request concurrency to save text history quickly. Request handling still goes through Vencord's `RestAPI`, so Discord rate limits remain in effect. After the text-history phase, queued media downloads continue separately.
 
-## التثبيت اليدوي للمطورين
+If a capture is interrupted, completed ranges are recorded in `capture/coverage.json`. Running full history capture again resumes the missing ranges instead of downloading proven ranges again.
 
-```powershell
-Copy-Item -Recurse plugin\LocalGroupArchive Vencord\src\userplugins\
-Copy-Item -Recurse plugin\LocalGroupArchiveSetup Vencord\src\userplugins\
-cd Vencord
-pnpm install --frozen-lockfile
-pnpm build --disable-updater
-pnpm inject
+## Automatic Group DM archiving
+
+Automatic archiving is designed only for new Group DMs. A saved cutoff prevents an old Group DM from being mistaken for a new one when Discord loads it into `ChannelStore` later.
+
+When automatic archiving is enabled, a newly created Group DM or a Group DM you are newly added to can begin archiving automatically. Existing Group DMs remain unchanged unless you start archiving them manually.
+
+Direct Messages are never automatically enabled.
+
+## Slash command
+
+Use `/localarchive` inside a Direct Message or Group DM.
+
+| Action | Description |
+| --- | --- |
+| `start` | Enable persistent archiving for the current conversation and capture missing history |
+| `full` | Capture the full available history once without enabling persistent archiving if it was previously off |
+| `snapshot` | Save messages currently loaded in Discord's message store |
+| `wait` | Wait for queued media downloads to finish |
+| `auto-on` | Enable automatic archiving for new Group DMs |
+| `auto-off` | Disable automatic archiving for new Group DMs |
+| `viewer` | Open the local archive viewer |
+| `folder` | Open the archive folder |
+| `health` | Check archive integrity and storage usage |
+| `repair` | Rebuild viewer indexes and remove stale temporary files |
+| `guide` | Open the setup guide |
+| `baseline-reset` | Treat currently existing Group DMs as the automatic-archive baseline |
+| `stop` | Disable persistent archiving for the current conversation |
+| `status` | Show archive status and download queue information |
+
+Actions that manage the archive folder, viewer, health, repair, setup guide, or automatic Group DM setting can be selected from any channel where Vencord exposes the command. Conversation-specific capture actions require a Direct Message or Group DM.
+
+## One-time full capture
+
+`full` is the simplest option when you only want a local copy of a conversation.
+
+If persistent archiving is off before the command starts, the plugin temporarily enables writes for the conversation, captures the available history and media, waits for queued media to finish, then returns the conversation to the previous disabled state. Running `full` again later reuses existing data and does not intentionally duplicate saved messages.
+
+## Persistent archiving
+
+`start` keeps the current Direct Message or Group DM enabled after the initial capture. New messages, edits, deletions, and reaction changes are written to the local archive while Vencord is running. Completed archives are periodically checked for small missed deltas.
+
+Use `stop` to disable persistent archiving without deleting existing local files.
+
+## Viewer
+
+The local viewer runs on `127.0.0.1` and reads the saved archive from disk. Archived Group DMs that are no longer available in Discord can appear as local read-only entries in the DM list when they were persistently protected before access was lost.
+
+## Installation on Windows
+
+1. Download the latest `LocalGroupArchive-Setup-vX.Y.Z.exe` and its `.sha256` file from GitHub Releases.
+2. Run the installer. Administrator access is not required.
+3. The release workflow builds a Developer Vencord runtime from the pinned Vencord commit used by this project.
+4. The installer verifies the packaged runtime and installs the userplugin.
+5. Restart Discord if the installer does not restart it automatically, then enable LocalGroupArchive in Vencord settings.
+
+The installer is not signed with a commercial Windows code-signing certificate, so Windows SmartScreen may appear on first launch. Verify the published SHA-256 hash before running the installer.
+
+Uninstalling the plugin restores the original Discord `app.asar` and leaves `Documents\DiscordLocalArchive` untouched.
+
+## Safety and limitations
+
+- The plugin uses the permissions of the signed-in Discord account.
+- It does not use a raw user token to bypass REST rate limits.
+- Discord can change private APIs at any time, which may require plugin updates.
+- Search results for older history may not include every field that normal message-history responses include. The plugin verifies history ranges and falls back to direct history requests when needed.
+- Deleted or inaccessible content cannot be recovered if Discord no longer provides it.
+
+## Development
+
+The repository contains the Vencord userplugin, native archive helpers, viewer code, installer, smoke tests, and GitHub Actions workflows used to build releases.
+
+Run the repository smoke tests with:
+
+```bash
+npm test
 ```
 
-يفضّل استخدام commit Vencord المذكور أعلاه لهذه النسخة لأن patch واجهة الـDM مربوط ببنية ذلك الإصدار المختبرة. إضافة `LocalGroupArchiveSetup` مسؤولة عن دليل التفعيل الأول.
+Release builds additionally compile the plugin against the pinned Vencord version and run TypeScript and ESLint checks before publishing the installer.
 
-## هيكل المشروع
+## License
 
-- `plugin/LocalGroupArchive/index.ts`: اكتشاف القروبات، REST/Gateway، الأولويات، Ghost DMs، والطابور.
-- `plugin/LocalGroupArchive/historyPlanner.ts`: تخطيط الحدود الحقيقية وتقسيم التاريخ إلى مسارات غير متداخلة.
-- `plugin/LocalGroupArchive/native.ts`: التخزين، capture packs، التنزيل، viewer server، والفهرسة.
-- `plugin/LocalGroupArchive/viewer.ts`: واجهة الأرشيف المحلية.
-- `plugin/LocalGroupArchiveSetup`: دليل التفعيل الحي.
-- `installer`: التثبيت، الإصلاح، التحديث، والإزالة.
-- `tests`: اختبارات viewer، التخزين، patch guards، تقسيم Smart Hybrid، والاستئناف والإصلاح الموجّه على fixture من 12,872 رسالة.
-
-## الترخيص
-
-GPL-3.0-or-later. راجع [LICENSE](LICENSE).
+GPL-3.0-or-later

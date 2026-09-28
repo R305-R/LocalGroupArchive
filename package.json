@@ -1,8 +1,8 @@
 {
   "name": "local-group-archive",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": true,
-  "description": "A resilient local Group DM archive userplugin for developer Vencord.",
+  "description": "A resilient local archive for Discord Direct Messages and Group DMs.",
   "license": "GPL-3.0-or-later",
   "scripts": {
     "test": "node --experimental-vm-modules tests/smoke.mjs"

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.4
+
+- Added manual archiving support for Direct Messages in addition to Group DMs.
+- Kept automatic archiving limited to new Group DMs.
+- Replaced promotional command labels and status text with short, consistent terminology.
+- Rewrote the project README in English and documented Direct Message support.
+
 ## 0.9.3
 
 - Replaced the on-device Vencord build with a **precompiled Windows Vencord runtime** produced by the release workflow. The user's PC no longer installs Node.js, pnpm, or 561 dependency packages.
