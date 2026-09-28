@@ -38,7 +38,8 @@ const STORE_KEY = "LocalGroupArchive_enabledChannels";
 const AUTO_KEY = "LocalGroupArchive_autoNewGroups";
 const BASELINE_KEY = "LocalGroupArchive_v070BaselineGroupIds";
 const BASELINE_CUTOFF_KEY = "LocalGroupArchive_v072NewGroupCutoffMs";
-const PLUGIN_VERSION = "0.9.3";
+const PLUGIN_VERSION = "0.9.4";
+const DM_TYPE = 1;
 const GROUP_DM_TYPE = 3;
 const HISTORY_PAGE_SIZE = 100;
 const MAX_HISTORY_PAGES = 5000;
@@ -206,10 +207,22 @@ function isGroupDm(channelId: string) {
     return ChannelStore.getChannel(channelId)?.type === GROUP_DM_TYPE;
 }
 
+function isArchiveableDm(channelId: string) {
+    const type = ChannelStore.getChannel(channelId)?.type;
+    return type === DM_TYPE || type === GROUP_DM_TYPE;
+}
+
 function currentGroupIds() {
     const channels = ChannelStore.getMutablePrivateChannels?.() ?? {};
     return Object.values(channels)
         .filter((channel: any) => channel?.type === GROUP_DM_TYPE && channel?.id)
+        .map((channel: any) => String(channel.id));
+}
+
+function currentArchiveableDmIds() {
+    const channels = ChannelStore.getMutablePrivateChannels?.() ?? {};
+    return Object.values(channels)
+        .filter((channel: any) => (channel?.type === DM_TYPE || channel?.type === GROUP_DM_TYPE) && channel?.id)
         .map((channel: any) => String(channel.id));
 }
 
@@ -806,7 +819,7 @@ async function saveMessageBatch(
 
 async function saveSingleMessage(message: any): Promise<BatchOutcome> {
     const channelId = String(message?.channel_id ?? message?.channelId ?? "");
-    if (!baselineReady || !channelId || !enabledChannels.has(channelId) || !isGroupDm(channelId)) {
+    if (!baselineReady || !channelId || !enabledChannels.has(channelId) || !isArchiveableDm(channelId)) {
         return { saved: 0, attachmentsQueued: 0 };
     }
 
@@ -939,7 +952,7 @@ async function runAnchorProbe(
     route: HybridSearchRoute = "channel"
 ) {
     if (!pluginRunning || !enabledChannels.has(channelId)
-        || historyGenerations.get(channelId) !== generation || !isGroupDm(channelId)) {
+        || historyGenerations.get(channelId) !== generation || !isArchiveableDm(channelId)) {
         return { messages: [] as any[], attempted: false, available: false, route };
     }
 
@@ -1057,7 +1070,7 @@ async function discoverHistoryAnchors(channelId: string, generation: number, sta
 
 function shouldContinueForFullCapture(channelId: string, generation: number) {
     return pluginRunning && enabledChannels.has(channelId)
-        && historyGenerations.get(channelId) === generation && isGroupDm(channelId);
+        && historyGenerations.get(channelId) === generation && isArchiveableDm(channelId);
 }
 
 interface SearchSweepTabResult {
@@ -1202,7 +1215,7 @@ async function archiveFullHistorySearchSweepInner(channelId: string, generation:
             const average = searchRequests ? totalSearchWaitMs / searchRequests : 0;
             const backend = searchRequests ? totalBackendMs / searchRequests : 0;
             sendBotMessage(channelId, {
-                content: `🚀 **Search Sweep:** ${seen.size.toLocaleString()}${expectedMessages ? ` / ${expectedMessages.toLocaleString()}` : ""} message(s) durable/queued, ${restPages} normal edge page(s) + ${searchRequests} search HTTP request(s) / ${searchTabs} server tab(s), ${((now - startedAt) / 1000).toFixed(1)}s elapsed${average ? `, avg search ${(average / 1000).toFixed(2)}s` : ""}${backend ? `, Discord search ${(backend / 1000).toFixed(2)}s` : ""}.`
+                content: `**History capture progress:** ${seen.size.toLocaleString()}${expectedMessages ? ` / ${expectedMessages.toLocaleString()}` : ""} message(s) durable/queued, ${restPages} normal edge page(s) + ${searchRequests} search HTTP request(s) / ${searchTabs} server tab(s), ${((now - startedAt) / 1000).toFixed(1)}s elapsed${average ? `, avg search ${(average / 1000).toFixed(2)}s` : ""}${backend ? `, Discord search ${(backend / 1000).toFixed(2)}s` : ""}.`
             });
         };
 
@@ -1521,7 +1534,7 @@ async function archiveFullHistoryAnchoredInner(channelId: string, generation: nu
             lastProgressAt = now;
             const avg = requestSamples ? totalRequestMs / requestSamples : 0;
             sendBotMessage(channelId, {
-                content: `⏱️ **Full capture progress:** ${messages.toLocaleString()} unique message(s), ${pages} completed history page(s), ${anchorProbe.queries} anchor probe(s), ${workerCount} lane(s), ${((now - startedAt) / 1000).toFixed(1)}s elapsed${avg ? `, avg REST wait ${(avg / 1000).toFixed(2)}s` : ""}.`
+                content: `**History capture progress:** ${messages.toLocaleString()} unique message(s), ${pages} completed history page(s), ${anchorProbe.queries} anchor probe(s), ${workerCount} lane(s), ${((now - startedAt) / 1000).toFixed(1)}s elapsed${avg ? `, avg REST wait ${(avg / 1000).toFixed(2)}s` : ""}.`
             });
         };
 
@@ -1992,7 +2005,7 @@ async function archiveFullHistoryHybridInner(channelId: string, generation: numb
             const completeSegments = coverage.segments.filter(segment => segment.status === "complete").length;
             const panicRemaining = Math.max(0, panicUntil - now);
             sendBotMessage(channelId, {
-                content: `⚡ **Smart Hybrid${panicRemaining ? " PANIC" : ""}:** ${seen.size.toLocaleString()} new unique message(s) durable/queued${panicRemaining ? `, ${(panicRemaining / 1000).toFixed(1)}s burst left` : `, ${panicMessages.toLocaleString()} rescued inside the first ${(PANIC_BURST_MS / 1000).toFixed(0)}s`}, ${completeSegments}/${coverage.segments.length} range(s) proven, ${pages} normal + ${searchRequests} channel-search + ${globalSearchRequests} global-search request(s), ${normalPending} normal / ${searchPending} search range(s) active, adaptive normal concurrency ${normalPending ? normalGate.concurrency : "idle"}, ${((now - startedAt) / 1000).toFixed(1)}s elapsed.`
+                content: `**History capture progress:** ${seen.size.toLocaleString()} new unique message(s) durable/queued${panicRemaining ? `, ${(panicRemaining / 1000).toFixed(1)}s burst left` : `, ${panicMessages.toLocaleString()} rescued inside the first ${(PANIC_BURST_MS / 1000).toFixed(0)}s`}, ${completeSegments}/${coverage.segments.length} range(s) proven, ${pages} normal + ${searchRequests} channel-search + ${globalSearchRequests} global-search request(s), ${normalPending} normal / ${searchPending} search range(s) active, adaptive normal concurrency ${normalPending ? normalGate.concurrency : "idle"}, ${((now - startedAt) / 1000).toFixed(1)}s elapsed.`
             });
         };
 
@@ -2567,7 +2580,7 @@ async function archiveOlderHistoryInner(channelId: string, generation: number): 
     try {
         try {
             while (pages < MAX_HISTORY_PAGES) {
-                if (!pluginRunning || !enabledChannels.has(channelId) || !isGroupDm(channelId)
+                if (!pluginRunning || !enabledChannels.has(channelId) || !isArchiveableDm(channelId)
                     || olderBackfillGenerations.get(channelId) !== generation) {
                     cancelled = true;
                     break;
@@ -2674,7 +2687,7 @@ async function archiveRecentHistoryInner(channelId: string, generation: number):
     holdAttachmentPump();
     try {
         while (pages < MAX_HISTORY_PAGES) {
-            if (!pluginRunning || !enabledChannels.has(channelId) || !isGroupDm(channelId)
+            if (!pluginRunning || !enabledChannels.has(channelId) || !isArchiveableDm(channelId)
                 || historyGenerations.get(channelId) !== generation) {
                 cancelled = true;
                 break;
@@ -2770,7 +2783,7 @@ async function refreshArchivedMetadata() {
 }
 
 function ghostChannelIds() {
-    const current = new Set(currentGroupIds());
+    const current = new Set(currentArchiveableDmIds());
     return [...enabledChannels]
         .filter(channelId => !current.has(channelId) && archivedMetadata.has(channelId))
         .sort((a, b) => snowflakeCompare(b, a));
@@ -2874,7 +2887,7 @@ async function resetBaselineToCurrentGroups() {
 }
 
 async function resumeEnabledArchives() {
-    const channelIds = [...enabledChannels].filter(isGroupDm);
+    const channelIds = [...enabledChannels].filter(isArchiveableDm);
     let next = 0;
     const worker = async () => {
         while (pluginRunning) {
@@ -2900,7 +2913,7 @@ async function reconcileWarmMirrorOnce(maxChannels = 1) {
     if (!pluginRunning || warmMirrorReconcileRunning) return;
     warmMirrorReconcileRunning = true;
     try {
-        const channelIds = [...enabledChannels].filter(isGroupDm).sort(snowflakeCompare);
+        const channelIds = [...enabledChannels].filter(isArchiveableDm).sort(snowflakeCompare);
         const targets: string[] = [];
         for (let inspected = 0; inspected < channelIds.length && targets.length < Math.max(1, maxChannels); inspected++) {
             const index = warmMirrorCursor++ % channelIds.length;
@@ -3048,13 +3061,15 @@ function startAuthoritativeNewAccessCapture(channelId: string, attempt = 0) {
 function onChannelCreate(event: any) {
     const channel = event?.channel ?? event;
     const channelId = String(channel?.id ?? "");
-    if (!channelId || channel?.type !== GROUP_DM_TYPE) return;
+    if (!channelId) return;
 
-    if (enabledChannels.has(channelId) && startupCatchupPending.delete(channelId)) {
-        knownGroupIds.add(channelId);
+    if ((channel?.type === DM_TYPE || channel?.type === GROUP_DM_TYPE)
+        && enabledChannels.has(channelId) && startupCatchupPending.delete(channelId)) {
+        if (channel?.type === GROUP_DM_TYPE) knownGroupIds.add(channelId);
         runBackground("Late channel-create catch-up failed", archiveRecentHistory(channelId));
         return;
     }
+    if (channel?.type !== GROUP_DM_TYPE) return;
     if (!baselineReady) {
         pendingNewDuringBaseline.add(channelId);
         return;
@@ -3113,9 +3128,9 @@ function onChannelDelete(event: any) {
 function onChannelUpdate(event: any) {
     const channel = event?.channel ?? event;
     const channelId = String(channel?.id ?? "");
-    if (!channelId || !isGroupDm(channelId) || !enabledChannels.has(channelId)) return;
+    if (!channelId || !isArchiveableDm(channelId) || !enabledChannels.has(channelId)) return;
     void ensureChannel(channelId, true).catch(error => {
-        console.warn("[LocalGroupArchive] Could not refresh Group DM metadata", error);
+        console.warn("[LocalGroupArchive] Could not refresh conversation metadata", error);
     });
 }
 
@@ -3214,35 +3229,31 @@ async function restoreAndEnable(channelId: string) {
 
 function historySummary(result: HistoryResult) {
     const fetchShape = result.strategy === "hybrid"
-        ? `Fetched **${result.messages}** new unique message object(s) and safely wrote **${result.saved}** message object(s) using ${result.pages} normal-history + ${result.searchRequests ?? 0} channel-search + ${result.globalSearchRequests ?? 0} global-DM-search request(s) (${result.searchTabs ?? 0} server tab(s)).`
+        ? `Fetched **${result.messages}** unique message object(s) and wrote **${result.saved}** message object(s) using ${result.pages} history + ${result.searchRequests ?? 0} channel-search + ${result.globalSearchRequests ?? 0} global-DM-search request(s).`
         : result.strategy === "search-sweep"
-            ? `Fetched **${result.messages}**${result.expectedMessages ? ` / ${result.expectedMessages}` : ""} and safely wrote **${result.saved}** message(s) using ${result.pages} normal history request(s) + ${result.searchRequests ?? 0} Search Sweep HTTP request(s) (${result.searchTabs ?? 0} server tab(s)).`
-            : `Fetched **${result.messages}** and safely wrote **${result.saved}** message(s) across ${result.pages} page(s).`;
-    const parts = [
-        fetchShape,
-        `${result.attachmentsQueued} new media download(s) queued.`
-    ];
-    if (result.writeFailures) parts.push(`⚠️ ${result.writeFailures} disk batch(es) failed.`);
-    if (result.reachedLimit) parts.push("⚠️ The global 5,000-request safety ceiling was reached; older messages may remain.");
+            ? `Fetched **${result.messages}**${result.expectedMessages ? ` / ${result.expectedMessages}` : ""} and wrote **${result.saved}** message(s) using ${result.pages} history request(s) and ${result.searchRequests ?? 0} search request(s).`
+            : `Fetched **${result.messages}** and wrote **${result.saved}** message(s) across ${result.pages} history request(s).`;
+    const parts = [fetchShape, `${result.attachmentsQueued} new media download(s) queued.`];
+    if (result.writeFailures) parts.push(`${result.writeFailures} disk batch(es) failed.`);
+    if (result.reachedLimit) parts.push("The 5,000-request safety limit was reached; older messages may remain.");
     if (result.partialError) parts.push(`Partial error: ${result.partialError}`);
-    if (result.cancelled) parts.push("Capture was interrupted; already-written capture packs were preserved.");
+    if (result.cancelled) parts.push("Capture was interrupted; data already written to disk was kept.");
     if (result.strategy === "hybrid" && typeof result.panicMessages === "number") {
-        parts.push(`Panic Burst rescued **${result.panicMessages}** unique message object(s) inside its first ${(PANIC_BURST_MS / 1000).toFixed(0)}s window.`);
+        parts.push(`Captured **${result.panicMessages}** unique message object(s) during the first ${(PANIC_BURST_MS / 1000).toFixed(0)} seconds.`);
     }
-    if (result.stolenSegments) parts.push(`Authoritative workers took over **${result.stolenSegments}** slow search range(s).`);
-    if (result.resumedSegments) parts.push(`Resumed with **${result.resumedSegments}** already-proven range(s), without refetching them.`);
-    if (result.repairedSegments) parts.push(`Authoritatively repaired only **${result.repairedSegments}** unproven range(s).`);
+    if (result.resumedSegments) parts.push(`Reused **${result.resumedSegments}** completed range(s) without downloading them again.`);
+    if (result.repairedSegments) parts.push(`Verified **${result.repairedSegments}** incomplete range(s) with direct history requests.`);
     if (typeof result.elapsedMs === "number") {
         const strategy = result.strategy === "hybrid"
-            ? `Smart Hybrid, ${result.anchors ?? 0} real anchor(s), peak ${result.peakLanes ?? 1} route lane(s)`
+            ? `hybrid capture, ${result.anchors ?? 0} anchor(s), peak ${result.peakLanes ?? 1} concurrent request lane(s)`
             : result.strategy === "search-sweep"
-                ? `Search Sweep, 5×25 messages per search HTTP, peak ${result.peakLanes ?? SEARCH_SWEEP_CONCURRENCY} request worker(s)`
+                ? `search capture, peak ${result.peakLanes ?? SEARCH_SWEEP_CONCURRENCY} request worker(s)`
                 : result.strategy === "anchored"
-                    ? `Anchored Burst repair, ${result.anchors ?? 0} anchor(s), peak ${result.peakLanes ?? 1} lane(s)`
-                    : "single-cursor fallback";
-        const anchorInfo = result.anchorQueries ? `, ${result.anchorQueries} search-anchor request(s)` : "";
-        const avg = result.averageRequestMs ? `, avg request wait ${(result.averageRequestMs / 1000).toFixed(2)}s` : "";
-        parts.push(`Network + durable capture: **${(result.elapsedMs / 1000).toFixed(2)}s** (${strategy}${anchorInfo}${avg}).`);
+                    ? `anchored history capture, ${result.anchors ?? 0} anchor(s), peak ${result.peakLanes ?? 1} lane(s)`
+                    : "cursor history capture";
+        const anchorInfo = result.anchorQueries ? `, ${result.anchorQueries} anchor lookup request(s)` : "";
+        const avg = result.averageRequestMs ? `, average request wait ${(result.averageRequestMs / 1000).toFixed(2)}s` : "";
+        parts.push(`Capture time: **${(result.elapsedMs / 1000).toFixed(2)}s** (${strategy}${anchorInfo}${avg}).`);
     }
     return parts.join(" ");
 }
@@ -3272,7 +3283,7 @@ function archivedGroupName(meta: any, channelId: string) {
 
 export default definePlugin({
     name: "LocalGroupArchive",
-    description: "Fast local Group DM archiver with automatic new-group capture, attachments, and a Discord-style HTML viewer.",
+    description: "Local archive for Discord Direct Messages and Group DMs, including history, attachments, and an HTML viewer.",
     authors: [{ name: "Faisal", id: 0n }],
     tags: ["Chat", "Utility"],
 
@@ -3381,19 +3392,19 @@ export default definePlugin({
                     type: ApplicationCommandOptionType.STRING,
                     required: true,
                     choices: [
-                        commandChoice("INSTANT rescue + keep archiving (recommended)", "start"),
-                        commandChoice("ULTRA FULL history capture (Smart Hybrid one-shot)", "full"),
-                        commandChoice("Snapshot currently loaded messages", "snapshot"),
-                        commandChoice("Wait for attachment downloads", "wait"),
-                        commandChoice("Auto-protect NEW Group DMs: ON", "auto-on"),
-                        commandChoice("Auto-protect NEW Group DMs: OFF", "auto-off"),
-                        commandChoice("Open Discord-style HTML viewer", "viewer"),
+                        commandChoice("Start archiving", "start"),
+                        commandChoice("Capture full history", "full"),
+                        commandChoice("Capture loaded messages", "snapshot"),
+                        commandChoice("Wait for downloads", "wait"),
+                        commandChoice("Enable automatic archiving for new Group DMs", "auto-on"),
+                        commandChoice("Disable automatic archiving for new Group DMs", "auto-off"),
+                        commandChoice("Open archive viewer", "viewer"),
                         commandChoice("Open archive folder", "folder"),
-                        commandChoice("Check archive health + storage", "health"),
-                        commandChoice("Repair viewer + stale temp files", "repair"),
-                        commandChoice("Run interactive setup guide", "guide"),
-                        commandChoice("Reset NEW-group baseline to current groups", "baseline-reset"),
-                        commandChoice("Stop archiving this group", "stop"),
+                        commandChoice("Check archive health", "health"),
+                        commandChoice("Repair archive", "repair"),
+                        commandChoice("Open setup guide", "guide"),
+                        commandChoice("Reset new Group DM baseline", "baseline-reset"),
+                        commandChoice("Stop archiving", "stop"),
                         commandChoice("Show status", "status")
                     ]
                 }
@@ -3412,7 +3423,7 @@ export default definePlugin({
                     const prepared = await Native.prepareViewer();
                     await Native.openArchiveViewer();
                     sendBotMessage(channelId, {
-                        content: `Opened LocalGroupArchive **v${PLUGIN_VERSION}** viewer. Detected **${prepared.channels}** archived group(s) in \`${prepared.archiveRoot}\`.`
+                        content: `Opened LocalGroupArchive **v${PLUGIN_VERSION}** viewer. Detected **${prepared.channels}** archived conversation(s) in \`${prepared.archiveRoot}\`.`
                     });
                     return;
                 }
@@ -3430,7 +3441,7 @@ export default definePlugin({
                     sendBotMessage(channelId, { content: "Repairing viewer indexes and cleaning stale temporary files older than 15 minutes…" });
                     const result = await Native.repairArchive();
                     sendBotMessage(channelId, {
-                        content: `Repair complete: rebuilt **${result.rebuiltChannels}** group index(es), removed **${result.removedTransientFiles}** stale temporary file(s). Remaining corrupt message files: **${result.health.corruptMessages}**.`
+                        content: `Repair complete: rebuilt **${result.rebuiltChannels}** conversation index(es), removed **${result.removedTransientFiles}** stale temporary file(s). Remaining corrupt message files: **${result.health.corruptMessages}**.`
                     });
                     return;
                 }
@@ -3444,14 +3455,14 @@ export default definePlugin({
                 if (action === "auto-on") {
                     autoNewGroups = true;
                     await persistAutoSetting();
-                    sendBotMessage(channelId, { content: "**NEW-group shield is ON.** Only Group DMs whose channel IDs were actually created after the saved cutoff are auto-protected. Old/closed groups stay untouched even if Discord only reveals them later." });
+                    sendBotMessage(channelId, { content: "**Automatic new Group DM archiving is ON.** Only Group DMs whose channel IDs were actually created after the saved cutoff are auto-protected. Old/closed groups stay untouched even if Discord only reveals them later." });
                     return;
                 }
 
                 if (action === "auto-off") {
                     autoNewGroups = false;
                     await persistAutoSetting();
-                    sendBotMessage(channelId, { content: "**NEW-group shield is OFF.** Already-protected groups keep archiving; no untouched group will be enabled automatically." });
+                    sendBotMessage(channelId, { content: "**Automatic new Group DM archiving is OFF.** Already-protected groups keep archiving; no untouched group will be enabled automatically." });
                     return;
                 }
 
@@ -3461,8 +3472,8 @@ export default definePlugin({
                     return;
                 }
 
-                if (!isGroupDm(channelId)) {
-                    sendBotMessage(channelId, { content: "This action only works in **Group DMs**." });
+                if (!isArchiveableDm(channelId)) {
+                    sendBotMessage(channelId, { content: "This action only works in **Direct Messages and Group DMs**." });
                     return;
                 }
 
@@ -3477,15 +3488,15 @@ export default definePlugin({
                     const hasLocalArchive = Number(bounds?.count ?? 0) > 0 && typeof bounds?.newestId === "string";
                     const historyReady = Boolean(complete) && hasLocalArchive;
                     const resumableHybrid = !historyReady && isHybridCoverageLedger(storedCoverage, channelId);
-                    sendBotMessage(channelId, {
-                        content: historyReady
-                            ? "⚡ **Instant rescue started.** The local history baseline is complete, so only the newest delta is requested while Discord's currently-loaded cache is snapshotted immediately."
-                            : resumableHybrid
-                                ? "⚡ **Smart Hybrid resume started.** Completed history ranges stay completed; only the interrupted ranges and the newest delta are requested again."
+                sendBotMessage(channelId, {
+                    content: historyReady
+                        ? "Archive update started. The saved history is complete, so only new messages and the currently loaded cache will be checked."
+                        : resumableHybrid
+                            ? "History capture resumed. Completed ranges will not be downloaded again."
                             : hasLocalArchive
-                                ? "⚡ **Partial-archive rescue started.** New messages are rescued immediately while the missing oldest tail is verified/backfilled independently."
-                                : "🚨 **Cold Smart Hybrid Panic Burst started.** For the first 5 seconds LocalGroupArchive snapshots Discord cache, opens six normal lanes plus two workers on each search route, and defers proof checkpoints so rescue never waits on bookkeeping. After the burst, idle normal workers take over slow search ranges and exact verification repairs only what remains unproven. All media traffic waits until critical text capture stops."
-                    });
+                                ? "Archive update started. New messages and any missing older history will be captured."
+                                : "Full history capture started. Text history is captured before queued media downloads."
+                });
 
                     try {
                         // Snapshot the renderer cache immediately. This protects messages already in
@@ -3505,12 +3516,12 @@ export default definePlugin({
                         const [snapshot, result] = await Promise.all([snapshotPromise, historyPromise]);
                         const nowReady = await Native.isHistoryComplete(channelId).catch(() => false);
                         sendBotMessage(channelId, {
-                            content: `${historyReady ? "⚡ Delta rescue" : resumableHybrid ? "⚡ Smart Hybrid resume" : hasLocalArchive ? "⚡ Partial-archive rescue" : "🚀 Cold Smart Hybrid rescue"}: snapshotted **${snapshot.saved}** loaded message(s). ${historySummary(result)} History baseline: **${nowReady ? "READY ⚡" : "still capturing"}**. New messages keep archiving automatically.`
+                            content: `Archive updated. Captured **${snapshot.saved}** loaded message(s). ${historySummary(result)} History state: **${nowReady ? "complete" : "incomplete"}**. New messages will continue to be archived.`
                         });
                     } catch (error: any) {
-                        console.error("[LocalGroupArchive] Rescue failed", error);
+                        console.error("[LocalGroupArchive] Archive update failed", error);
                         sendBotMessage(channelId, {
-                            content: `Archive is still **ON**, but rescue hit an error: ${formatArchiveError(error)}`
+                            content: `Archive is still **ON**, but the update failed: ${formatArchiveError(error)}`
                         });
                     }
                     return;
@@ -3531,7 +3542,7 @@ export default definePlugin({
                     ensuredChannels.delete(channelId);
                     if (!await ensureChannel(channelId, true, true)) return;
 
-                    sendBotMessage(channelId, { content: `🚨 **ULTRA FULL one-shot capture started (v${PLUGIN_VERSION} Panic Burst).** This run does not permanently enable background archiving for an old group. The first 5 seconds front-load six normal lanes and two workers per independent search route; repeated slow completions cannot collapse concurrency, and proof checkpoints wait until after the rescue burst. Idle normal workers then take over slow search ranges. Exact channel-scoped totals and targeted authoritative repair still prove completeness, interrupted runs still resume from the durable coverage ledger, and media remains frozen until critical text capture stops. Progress appears about every 5 seconds.` });
+                    sendBotMessage(channelId, { content: `Full history capture started (v${PLUGIN_VERSION}). This is a one-time capture and does not enable background archiving unless it was already enabled. Existing completed ranges are reused, missing ranges are verified, and media downloads begin after the critical text-history phase. Progress is reported periodically.` });
                     try {
                         const result = await archiveFullHistory(channelId);
                         sendBotMessage(channelId, {
@@ -3587,7 +3598,7 @@ export default definePlugin({
                     cancelQueuedAttachments(channelId);
                     runBackground("Could not cancel channel downloads", Native.cancelChannelDownloads(channelId));
                     await persistEnabledChannels();
-                    sendBotMessage(channelId, { content: "Archive **OFF** for this group. Existing local files were kept." });
+                    sendBotMessage(channelId, { content: "Archive **OFF** for this conversation. Existing local files were kept." });
                     return;
                 }
 
@@ -3597,7 +3608,7 @@ export default definePlugin({
                         : olderBackfillJobs.has(channelId) ? " An older-tail verification/backfill is currently running." : "";
                 const historyReady = await Native.isHistoryComplete(channelId).catch(() => false);
                 sendBotMessage(channelId, {
-                    content: `LocalGroupArchive **v${PLUGIN_VERSION}**\n${enabledChannels.has(channelId) ? "Archive status: **ON**." : "Archive status: **OFF**."}${running}\nNEW-group shield: **${autoNewGroups ? "ON" : "OFF"}**. Warm Mirror: **live Gateway + ${WARM_MIRROR_RECONCILE_MS / 1000}s round-robin delta**. Cutoff: **${baselineCutoffMs ? new Date(baselineCutoffMs).toLocaleString() : "not set"}**. Known old/ignored: **${baselineGroupIds.size}**. This group's history: **${historyReady ? "READY ⚡" : "PARTIAL/COLD"}**.\nMedia workers: ${activeAttachmentJobs} active, ${attachmentQueue.length} queued, ${attachmentCompleted} completed, ${attachmentFailed} failed this session.`
+                    content: `LocalGroupArchive **v${PLUGIN_VERSION}**\n${enabledChannels.has(channelId) ? "Archive status: **ON**." : "Archive status: **OFF**."}${running}\nAutomatic new Group DM archiving: **${autoNewGroups ? "ON" : "OFF"}**. Warm Mirror: **live Gateway + ${WARM_MIRROR_RECONCILE_MS / 1000}s round-robin delta**. Cutoff: **${baselineCutoffMs ? new Date(baselineCutoffMs).toLocaleString() : "not set"}**. Known old/ignored: **${baselineGroupIds.size}**. This conversation's history: **${historyReady ? "READY ⚡" : "PARTIAL/COLD"}**.\nMedia workers: ${activeAttachmentJobs} active, ${attachmentQueue.length} queued, ${attachmentCompleted} completed, ${attachmentFailed} failed this session.`
                 });
             }
         }
