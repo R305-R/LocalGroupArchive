@@ -29,6 +29,7 @@ jobs:
           from pathlib import Path
           p = Path('.github/scripts/apply_direct_dm_clean_ui.py')
           s = p.read_text(encoding='utf-8')
+
           old = '''before_filter_count = text.count('const channelIds = [...enabledChannels].filter(isGroupDm);')
           if before_filter_count != 2:
               raise SystemExit(f"persistent archive filters: expected 2 matches, found {before_filter_count}")
@@ -50,7 +51,18 @@ jobs:
           )'''
           if old not in s:
               raise SystemExit('patch helper filter block not found')
-          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          s = s.replace(old, new, 1)
+
+          start = s.index("old_final = '''")
+          end_marker = 'once(old_final, new_final, "start completion text")'
+          end = s.index(end_marker, start) + len(end_marker)
+          replacement = '''once(
+              'content: `${historyReady ? "⚡ Delta rescue" : resumableHybrid ? "⚡ Smart Hybrid resume" : hasLocalArchive ? "⚡ Partial-archive rescue" : "🚀 Cold Smart Hybrid rescue"}: snapshotted **${snapshot.saved}** loaded message(s). ${historySummary(result)} History baseline: **${nowReady ? "READY ⚡" : "still capturing"}**. New messages keep archiving automatically.`',
+              'content: `Archive updated. Captured **${snapshot.saved}** loaded message(s). ${historySummary(result)} History state: **${nowReady ? "complete" : "incomplete"}**. New messages will continue to be archived.`',
+              "start completion text",
+          )'''
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s, encoding='utf-8')
           PY
 
       - name: Apply changes
